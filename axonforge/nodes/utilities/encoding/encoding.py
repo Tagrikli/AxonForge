@@ -13,6 +13,59 @@ from ....core.descriptors import branch
 
 
 
+@branch("Utilities/Encoding")
+class IntegerFeedbackEncoder(Node):
+    """Encode an integer into a sparse feedback vector.
+    
+    Maps an integer (e.g., a digit 0-9) to a vector of size N, where a configurable
+    number of templates are set to 1.0 and the rest to 0.0. The active templates
+    are assigned using a sliding window approach, allowing for overlap if the
+    number of templates per digit is large relative to the vector size.
+    """
+
+    i_value = InputPort("Value", int)
+    o_output = OutputPort("Output", np.ndarray)
+
+    vector_size = Integer("Vector Size", default=20)
+    templates_per_value = Integer("Templates per Value", default=2)
+    max_value = Integer("Max Value", default=9)
+    contrast = Range("Contrast", default=1.0, min_val=1.0, max_val=2.0, step=0.01)
+
+    vector1d = Vector1D("Vector", color_mode="binary")
+    info = Text("Info", default="No input")
+
+    def process(self):
+        if self.i_value is None:
+            return
+
+        val = int(self.i_value)
+        size = int(self.vector_size)
+        t_per_val = int(self.templates_per_value)
+        max_val = int(self.max_value)
+        c_val = float(self.contrast)
+
+        # Clamp value
+        val = max(0, min(max_val, val))
+
+        # Initialize with the suppressed value
+        suppressed_val = 2.0 - c_val
+        output = np.full(size, suppressed_val, dtype=np.float32)
+
+        if size > 0 and t_per_val > 0:
+            num_values = max_val + 1
+            stride = size / float(num_values)
+            
+            start_index = int(round(val * stride))
+            
+            for i in range(t_per_val):
+                idx = (start_index + i) % size
+                output[idx] = c_val
+
+        self.o_output = output
+        self.vector1d = output
+        self.info = f"Value: {val}, Active: {t_per_val}/{size}, Contrast: {c_val:.2f}"
+
+
 class OneHotEncode(Node):
 
     i_index = InputPort("Category Index", int)

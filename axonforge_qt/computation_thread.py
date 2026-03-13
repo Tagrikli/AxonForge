@@ -7,6 +7,7 @@ rate and reads the buffer when dirty.
 """
 
 import time
+from collections import deque
 
 from PySide6.QtCore import QThread, Signal
 
@@ -20,11 +21,14 @@ class ComputationThread(QThread):
 
     # Emitted when a node processing error occurs
     network_error = Signal(str, str, str, str)  # node_id, node_name, error, traceback
+    HZ_MOVING_AVG_WINDOW = 30
 
     def __init__(self, bridge: BridgeAPI, parent=None) -> None:
         super().__init__(parent)
         self.bridge = bridge
         self._stop_flag = False
+        self._hz_samples = deque(maxlen=self.HZ_MOVING_AVG_WINDOW)
+        self._hz_sum = 0.0
 
     def run(self) -> None:
         network = self.bridge.network
@@ -39,7 +43,13 @@ class ComputationThread(QThread):
                     if last is not None:
                         dt = now - last
                         if dt > 0:
-                            network.actual_hz = 1.0 / dt
+                            instant_hz = 1.0 / dt
+                            network.instant_hz = instant_hz
+                            if len(self._hz_samples) == self._hz_samples.maxlen:
+                                self._hz_sum -= self._hz_samples[0]
+                            self._hz_samples.append(instant_hz)
+                            self._hz_sum += instant_hz
+                            network.actual_hz = self._hz_sum / len(self._hz_samples)
                     self._last_step_time = now
 
                     # Snapshot display outputs into shared buffer

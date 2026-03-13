@@ -1,16 +1,13 @@
 """Dataset input nodes for MiniCortex."""
 
-
 import numpy as np
 
-from ....core.node import Node, background_init
-from ....core.descriptors.ports import InputPort, OutputPort
+from ....core.descriptors.displays import Text, Vector2D
+from ....core.descriptors.ports import OutputPort
 from ....core.descriptors.properties import Integer, Range
-from ....core.descriptors.displays import Vector2D, Text
 from ....core.descriptors.store import Store
-from ....core.descriptors import branch
+from ....core.node import Node, background_init
 from ....nodes.utilities import _load_dataset_with_python_mnist
-
 
 
 class InputDigitMNIST(Node):
@@ -20,13 +17,13 @@ class InputDigitMNIST(Node):
     output_digit = OutputPort("Digit", int)
     pattern = Vector2D("Pattern", color_mode="grayscale")
     digit = Text("Digit", default="0")
-    
+
     # Property: how many times to repeat each image
     repeat_count = Integer("Repeat", default=1)
-    
+
     # Property: digit filter (-1 = all, 0-9 = specific digit class)
     digit_filter = Range("Digit Filter", default=-1, min_val=-1, max_val=9, step=1)
-    
+
     # Store: index and step counter
     idx = Store(default=0)
     repeat_counter = Store(default=0)
@@ -46,7 +43,7 @@ class InputDigitMNIST(Node):
         if self._images is not None:
             # Increment repeat counter
             self.repeat_counter = int(self.repeat_counter) + 1
-            
+
             # Only advance to next digit when repeat_count is reached
             if int(self.repeat_counter) >= int(self.repeat_count):
                 filter_val = int(self.digit_filter)
@@ -59,7 +56,7 @@ class InputDigitMNIST(Node):
                     if len(indices) > 0:
                         self.idx = np.random.choice(indices)
                 self.repeat_counter = 0
-        
+
         self._update_pattern()
 
     def _update_pattern(self):
@@ -68,4 +65,3 @@ class InputDigitMNIST(Node):
             self.pattern = self._images[self.idx]
             self.output_digit = int(self._labels[self.idx])
             self.digit = str(self._labels[self.idx])
-

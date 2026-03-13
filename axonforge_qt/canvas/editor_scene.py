@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QLineF
+from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QLineF, QTimer
 from PySide6.QtGui import QPen, QColor
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsSceneMouseEvent, QGraphicsProxyWidget, QApplication
 
@@ -61,7 +61,19 @@ class EditorScene(QGraphicsScene):
 
         return item
 
+    def _clear_interactions_for_node(self, node_id: str) -> None:
+        if self._highlighted_port and self._highlighted_port.node_id == node_id:
+            self._highlighted_port.set_highlighted(False)
+            self._highlighted_port = None
+        if self._connect_from_port and self._connect_from_port.node_id == node_id:
+            if self._preview_line:
+                self.removeItem(self._preview_line)
+                self._preview_line = None
+            self._connecting = False
+            self._connect_from_port = None
+
     def remove_node_item(self, node_id: str) -> None:
+        self._clear_interactions_for_node(node_id)
         item = self._node_items.pop(node_id, None)
         if item:
             self.removeItem(item)
@@ -88,6 +100,37 @@ class EditorScene(QGraphicsScene):
         """
         self._node_z_seq += 1
         node_item.setZValue(Z_NODE + self._node_z_seq * self.NODE_FRONT_STEP)
+
+    def dispose(self) -> None:
+        """Release timers and interaction state before the scene is destroyed."""
+        if self._highlighted_port:
+            self._highlighted_port.set_highlighted(False)
+            self._highlighted_port = None
+        self._connect_from_port = None
+        self._preview_line = None
+        self._connecting = False
+        for item in list(self._node_items.values()):
+            try:
+                item.dispose()
+            except Exception:
+                pass
+        self.clear()
+        self._node_items.clear()
+        self._connection_items.clear()
+
+    def deactivate(self) -> None:
+        """Freeze scene-owned timers/interactions without destroying the items."""
+        if self._highlighted_port:
+            self._highlighted_port.set_highlighted(False)
+            self._highlighted_port = None
+        self._connect_from_port = None
+        self._preview_line = None
+        self._connecting = False
+        for item in list(self._node_items.values()):
+            try:
+                item.dispose()
+            except Exception:
+                pass
 
     # ── Connection management ────────────────────────────────────────────
 
@@ -304,11 +347,7 @@ class EditorScene(QGraphicsScene):
 
     def rebuild_from_topology(self, topology: dict) -> None:
         """Clear and rebuild all items from a topology snapshot."""
-        self.clear()
-        self._node_items.clear()
-        self._connection_items.clear()
-        self._preview_line = None
-        self._connecting = False
+        self.dispose()
         self._node_z_seq = 0
 
         for schema in topology.get("nodes", []):
@@ -454,14 +493,17 @@ class EditorScene(QGraphicsScene):
             print(f"Action failed: {e}")
 
     def _on_reload_requested(self, node_id: str) -> None:
-        try:
-            new_node = self.bridge.reload_node(node_id)
-            # Remove old item and rebuild
-            self.remove_node_item(node_id)
-            self.add_node_item(new_node.get_schema())
-            self._rebuild_connections()
-        except Exception as e:
-            print(f"Reload failed: {e}")
+        def _do_reload() -> None:
+            try:
+                new_node = self.bridge.reload_node(node_id)
+                # Remove old item and rebuild
+                self.remove_node_item(node_id)
+                self.add_node_item(new_node.get_schema())
+                self._rebuild_connections()
+            except Exception as e:
+                print(f"Reload failed: {e}")
+
+        QTimer.singleShot(0, _do_reload)
 
     # ── Mouse events for connection creation ─────────────────────────────
 

@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, Signal, QObject, QTimer
+from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, Signal, QObject, QTimer, QEvent
 from PySide6.QtGui import (
     QPen, QBrush, QColor, QPainter, QFont, QFontMetrics, QImage, QPainterPath,
 )
@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsProxyWidget,
     QWidget, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox, QPushButton,
     QHBoxLayout, QVBoxLayout, QLabel, QSizePolicy, QToolTip,
-    QStyleOptionGraphicsItem, QGraphicsSceneMouseEvent,
+    QStyleOptionGraphicsItem, QGraphicsSceneMouseEvent, QProxyStyle, QStyle,
 )
 
 from .port_item import PortItem, PortHitZoneItem
@@ -105,6 +105,30 @@ class _NodeSignals(QObject):
     reload_requested = Signal(str)                 # node_id
 
 
+class _DisableRightClickFilter(QObject):
+    """Filter to swallow right-click/context-menu events for input widgets."""
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.ContextMenu:
+            return True
+        if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+            button = getattr(event, "button", None)
+            if callable(button) and button() == Qt.MouseButton.RightButton:
+                return True
+        return super().eventFilter(watched, event)
+
+
+class _AbsoluteClickSliderStyle(QProxyStyle):
+    """Make left-click on slider groove jump directly to clicked value."""
+
+    def styleHint(self, hint, option=None, widget=None, returnData=None) -> int:
+        if hint == QStyle.StyleHint.SH_Slider_AbsoluteSetButtons:
+            return Qt.MouseButton.LeftButton.value
+        if hint == QStyle.StyleHint.SH_Slider_PageSetButtons:
+            return Qt.MouseButton.MiddleButton.value
+        return super().styleHint(hint, option, widget, returnData)
+
+
 class NodeItem(QGraphicsItem):
     """Visual representation of a Node on the canvas."""
 
@@ -126,6 +150,7 @@ class NodeItem(QGraphicsItem):
 
         # Proxy widgets for properties
         self._proxy_widgets: List[QGraphicsProxyWidget] = []
+        self._right_click_filters: List[QObject] = []
 
         # Display cache: {output_key: value}
         self._display_cache: Dict[str, Any] = {}
@@ -190,6 +215,24 @@ class NodeItem(QGraphicsItem):
         self._layout()
         if self._loading:
             self._loading_timer.start()
+
+    def dispose(self) -> None:
+        """Stop auxiliary Qt objects before the graphics item is destroyed."""
+        QToolTip.hideText()
+        self._tooltip_port = None
+        for timer in (self._tooltip_timer, self._loading_timer):
+            try:
+                timer.stop()
+            except Exception:
+                pass
+            try:
+                timer.timeout.disconnect()
+            except Exception:
+                pass
+            try:
+                timer.deleteLater()
+            except Exception:
+                pass
 
     # ── Port creation ────────────────────────────────────────────────────
 
@@ -276,6 +319,15 @@ class NodeItem(QGraphicsItem):
         return None
 
     def _make_range_widget(self, prop: dict, key: str) -> QWidget:
+        # Sanitize inputs to avoid invalid values reaching Qt widgets.
+        import math as _m
+        def _safe_float(v, default):
+            try:
+                fv = float(v)
+            except Exception:
+                return float(default)
+            return fv if _m.isfinite(fv) else float(default)
+
         container = QWidget()
         container.setStyleSheet("background: transparent;")
         layout = QVBoxLayout(container)
@@ -301,21 +353,36 @@ class NodeItem(QGraphicsItem):
         use_log = prop.get("scale") == "log" and prop.get("min", 0) > 0
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setFixedHeight(14)
+        click_style = _AbsoluteClickSliderStyle(slider.style())
+        click_style.setParent(slider)
+        slider.setStyle(click_style)
         slider.setStyleSheet(
             "QSlider::groove:horizontal { background: #11172a; height: 3px; }"
             "QSlider::handle:horizontal { background: #00f5ff; width: 10px; height: 10px; margin: -4px 0; }"
         )
 
-        pmin = prop.get("min", 0)
-        pmax = prop.get("max", 1)
-        step = prop.get("step", 0.01)
-        value = prop.get("value", prop.get("default", pmin))
+        pmin = _safe_float(prop.get("min", 0), 0.0)
+        pmax = _safe_float(prop.get("max", 1), 1.0)
+        step = _safe_float(prop.get("step", 0.01), 0.01)
+        value = _safe_float(prop.get("value", prop.get("default", pmin)), pmin)
+        if pmax < pmin:
+            pmin, pmax = pmax, pmin
+        if step <= 0:
+            step = 0.01
+        value = max(pmin, min(pmax, value))
 
         # Calculate number of steps based on step property
-        if step > 0:
-            steps = int((pmax - pmin) / step)
-        else:
-            steps = 1000
+        span = max(pmax - pmin, 0.0)
+        steps = int(span / step) if step > 0 else 1000
+        if steps < 1:
+            steps = 1
+        # Clamp steps to avoid huge slider ranges that can crash Qt.
+        if steps > 1_000_000:
+            print(
+                f"Warning: clamping range steps for {self.node_type}.{key} "
+                f"(span={span}, step={step})"
+            )
+            steps = 1_000_000
         
         slider.setMinimum(0)
         slider.setMaximum(max(steps, 1))
@@ -339,7 +406,6 @@ class NodeItem(QGraphicsItem):
 
         def on_slider_change(pos: int) -> None:
             if use_log:
-                import math as _m
                 log_min_ = _m.log10(pmin)
                 log_max_ = _m.log10(pmax)
                 real = 10 ** (log_min_ + (pos / steps) * (log_max_ - log_min_))
@@ -360,7 +426,9 @@ class NodeItem(QGraphicsItem):
             
             # Clamp the value to valid range
             real = max(pmin, min(pmax, real))
-            
+            if not _m.isfinite(real):
+                real = pmin
+
             val_lbl.setText(f"{real:.4f}" if prop.get("scale") == "log" else f"{real:.3f}")
             self.signals.property_changed.emit(self.node_id, key, real)
 
@@ -408,6 +476,10 @@ class NodeItem(QGraphicsItem):
         else:
             spin.setMaximum(999999)
         spin.setValue(int(prop.get("value", prop.get("default", 0))))
+        self._disable_widget_right_click(spin)
+        line_edit = spin.lineEdit()
+        if line_edit:
+            self._disable_widget_right_click(line_edit)
 
         def on_spin_change(v: int) -> None:
             val_lbl.setText(str(v))
@@ -452,6 +524,10 @@ class NodeItem(QGraphicsItem):
         spin.setMaximum(999999.0)
         spin.setDecimals(6)
         spin.setValue(float(prop.get("value", prop.get("default", 0.0))))
+        self._disable_widget_right_click(spin)
+        line_edit = spin.lineEdit()
+        if line_edit:
+            self._disable_widget_right_click(line_edit)
 
         def on_spin_change(v: float) -> None:
             val_lbl.setText(f"{v:.3f}")
@@ -462,6 +538,12 @@ class NodeItem(QGraphicsItem):
 
         container.setFixedHeight(34)
         return container
+
+    def _disable_widget_right_click(self, widget: QWidget) -> None:
+        widget.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        blocker = _DisableRightClickFilter(widget)
+        widget.installEventFilter(blocker)
+        self._right_click_filters.append(blocker)
 
     def _make_bool_widget(self, prop: dict, key: str) -> QWidget:
         container = QWidget()
@@ -607,7 +689,22 @@ class NodeItem(QGraphicsItem):
                 continue
 
             if otype == "vector2d":
-                h = self._width - 2 * PADDING  # square
+                data = self._display_cache.get(key)
+                if data is not None:
+                    if isinstance(data, list):
+                        data = np.array(data)
+                    
+                    if hasattr(data, "shape") and len(data.shape) >= 2:
+                        rows, cols = data.shape[:2]
+                        if cols > 0:
+                            aspect = rows / cols
+                            h = (self._width - 2 * PADDING) * aspect
+                        else:
+                            h = self._width - 2 * PADDING
+                    else:
+                        h = self._width - 2 * PADDING
+                else:
+                    h = self._width - 2 * PADDING  # default square
                 self._display_rects[key] = QRectF(PADDING, y, self._width - 2 * PADDING, h)
                 y += h + 2
             elif otype == "vector1d":
@@ -1383,7 +1480,7 @@ class NodeItem(QGraphicsItem):
     def update_displays(self, outputs: Dict[str, Any]) -> None:
         """Update cached display data and repaint."""
         changed = False
-        text_changed = False
+        layout_needed = False
         for key, value in outputs.items():
             if key in self._display_rects:
                 # Handle new format: {'value': ..., 'config': ...}
@@ -1405,20 +1502,40 @@ class NodeItem(QGraphicsItem):
                     display_value = value
                     config = {}
                     
-                # Check if text content changed for re-layout
+                # Check if content changed for re-layout
                 if key in self._display_cache:
                     old_value = self._display_cache[key]
                     if str(old_value) != str(display_value):
-                        # Check if this is a text output that needs re-layout
+                        # Check if this output needs re-layout
                         for output in self.schema.get("outputs", []):
-                            if output.get("key") == key and output.get("type") == "text":
-                                text_changed = True
+                            if output.get("key") == key:
+                                otype = output.get("type")
+                                if otype == "text":
+                                    layout_needed = True
+                                elif otype == "vector2d":
+                                    # Check if shape changed
+                                    def get_shape(v):
+                                        if hasattr(v, "shape"):
+                                            return v.shape
+                                        if isinstance(v, list):
+                                            # Simple heuristic for 2D list shape
+                                            rows = len(v)
+                                            cols = len(v[0]) if rows > 0 and isinstance(v[0], list) else 0
+                                            return (rows, cols)
+                                        return None
+                                    
+                                    if get_shape(old_value) != get_shape(display_value):
+                                        layout_needed = True
                                 break
+                else:
+                    # First time receiving data for this display - always re-layout
+                    layout_needed = True
+
                 self._display_cache[key] = display_value
                 changed = True
         if changed:
-            # Re-layout if text content changed to adjust node height
-            if text_changed:
+            # Re-layout if content changed to adjust node height
+            if layout_needed:
                 self._layout()
             self.update()
 
@@ -1426,7 +1543,14 @@ class NodeItem(QGraphicsItem):
 
     @staticmethod
     def _format_range_value(prop: dict) -> str:
+        import math as _m
         value = prop.get("value", prop.get("default", 0))
+        try:
+            value = float(value)
+        except Exception:
+            value = 0.0
+        if not _m.isfinite(value):
+            value = 0.0
         if prop.get("scale") == "log":
             return f"{value:.6f}"
         return f"{value:.3f}"

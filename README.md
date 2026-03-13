@@ -62,8 +62,8 @@ Core ideas:
 ### Install
 
 ```bash
-git clone https://github.com/your-username/MiniCortex.git
-cd MiniCortex
+git clone https://github.com/your-username/AxonForge.git
+cd AxonForge
 
 # using uv
 uv sync

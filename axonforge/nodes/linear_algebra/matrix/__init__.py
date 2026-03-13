@@ -210,3 +210,43 @@ class MatrixTransposeProjection(Node):
             self.info = f"{self.weights.shape}.T @ {x.shape} → {self.output.shape}"
         except Exception as e:
             self.info = f"Error: {e}"
+
+
+class MatrixCrop(Node):
+    """Crop a matrix according to start and end coordinates."""
+
+    input_data = InputPort("Input", np.ndarray)
+    output = OutputPort("Output", np.ndarray)
+    
+    x_start = Integer("X Start", default=0)
+    y_start = Integer("Y Start", default=0)
+    x_end = Integer("X End", default=10)
+    y_end = Integer("Y End", default=10)
+    
+    info = Text("Info", default="No input")
+
+    def process(self):
+        if self.input_data is None:
+            return
+
+        try:
+            # In numpy, first dimension is rows (Y), second is columns (X)
+            # So we use [y_start:y_end, x_start:x_end]
+            y1, y2 = int(self.y_start), int(self.y_end)
+            x1, x2 = int(self.x_start), int(self.x_end)
+            
+            # Basic validation/clamping
+            h, w = self.input_data.shape[:2]
+            y1 = max(0, min(h, y1))
+            y2 = max(0, min(h, y2))
+            x1 = max(0, min(w, x1))
+            x2 = max(0, min(w, x2))
+            
+            if y1 >= y2 or x1 >= x2:
+                self.info = "Invalid crop range"
+                return
+
+            self.output = self.input_data[y1:y2, x1:x2].copy().astype(np.float32)
+            self.info = f"{self.input_data.shape} → {self.output.shape}"
+        except Exception as e:
+            self.info = f"Error: {e}"

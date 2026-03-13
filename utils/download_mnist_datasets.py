@@ -15,6 +15,8 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 import sys
+import gzip
+import shutil
 
 
 DATASETS = {
@@ -66,32 +68,52 @@ def main() -> int:
         dataset_dir = target_root / dataset_name
         print(f"\n[{dataset_name}] -> {dataset_dir}")
         dataset_dir.mkdir(parents=True, exist_ok=True)
-
         for filename in spec["files"]:
-            dest = dataset_dir / filename
+            gz_filename = filename
+            uncompressed_filename = gz_filename[:-3]
+            gz_dest = dataset_dir / gz_filename
+            uncompressed_dest = dataset_dir / uncompressed_filename
 
-            if dest.exists() and dest.stat().st_size > 0:
-                print(f"  skip  {filename} (exists)")
+            if uncompressed_dest.exists() and uncompressed_dest.stat().st_size > 0:
+                print(f"  skip  {uncompressed_filename} (exists)")
                 continue
 
-            print(f"  fetch {filename}")
-            last_error = None
-            for base_url in spec["base_urls"]:
-                url = f"{base_url}/{filename}"
-                try:
-                    download_file(url, dest)
-                    last_error = None
-                    break
-                except (HTTPError, URLError, OSError) as exc:
-                    last_error = exc
-                    print(f"  fail  {filename} @ {base_url}: {exc}")
-                    if dest.exists():
-                        try:
-                            dest.unlink()
-                        except OSError:
-                            pass
-            if last_error is not None:
-                failures.append((filename, str(last_error)))
+            # Ensure gzipped file exists
+            if not gz_dest.exists() or gz_dest.stat().st_size == 0:
+                print(f"  fetch {gz_filename}")
+                last_error = None
+                for base_url in spec["base_urls"]:
+                    url = f"{base_url}/{gz_filename}"
+                    try:
+                        download_file(url, gz_dest)
+                        last_error = None
+                        break
+                    except (HTTPError, URLError, OSError) as exc:
+                        last_error = exc
+                        print(f"  fail  {gz_filename} @ {base_url}: {exc}")
+                        if gz_dest.exists():
+                            try:
+                                gz_dest.unlink()
+                            except OSError:
+                                pass
+                if last_error is not None:
+                    failures.append((gz_filename, str(last_error)))
+                    continue
+
+            # Decompress
+            print(f"  decompress {gz_filename}")
+            try:
+                with gzip.open(gz_dest, 'rb') as f_in:
+                    with open(uncompressed_dest, 'wb') as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                print(f"  -> {uncompressed_filename}")
+                # Clean up gz file after successful decompress
+                gz_dest.unlink(missing_ok=True)
+            except Exception as exc:
+                print(f"  decompress fail {gz_filename}: {exc}")
+                if uncompressed_dest.exists():
+                    uncompressed_dest.unlink()
+                failures.append((f"decompress {gz_filename}", str(exc)))
 
     if failures:
         print("\nSome downloads failed:", file=sys.stderr)

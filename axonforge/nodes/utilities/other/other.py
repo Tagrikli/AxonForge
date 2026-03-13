@@ -4,7 +4,7 @@ import numpy as np
 
 from axonforge.core.node import Node
 from axonforge.core.descriptors.ports import InputPort, OutputPort
-from axonforge.core.descriptors.properties import Integer
+from axonforge.core.descriptors.properties import Integer, Range, Float as FloatProp, Enum
 from axonforge.core.descriptors.displays import Text, Numeric
 
 
@@ -134,3 +134,103 @@ class JaccardIndex(Node):
         self.output_iou = float(jaccard)
         self.display = float(jaccard)
         self.info = f"Jaccard Index: {jaccard:.4f}\nIntersection: {intersection}\nUnion: {union}"
+
+
+class Slider(Node):
+    """Output a slider value in [0, 1]."""
+
+    value = Range("Value", default=0.0, min_val=0.0, max_val=1.0, step=0.01)
+    output = OutputPort("Output", float)
+
+    def process(self):
+        self.output = self.value
+
+
+class SliderLog(Node):
+    """Output a log-scaled slider value in [0.0001, 1]."""
+
+    value = Range(
+        "Value",
+        default=0.01,
+        min_val=0.0001,
+        max_val=1.0,
+        step=0.0001,
+        scale="log",
+    )
+    output = OutputPort("Output", float)
+
+    def process(self):
+        self.output = self.value
+
+
+class Float(Node):
+    """Output a float constant."""
+
+    value = FloatProp("Value", default=0.0)
+    output = OutputPort("Output", float)
+
+    def process(self):
+        self.output = self.value
+
+
+class RangeMap(Node):
+    """Map a 0..1 input to a [min, max] range."""
+
+    input_value = InputPort("Input", float)
+    min_value = FloatProp("Min", default=0.0)
+    max_value = FloatProp("Max", default=1.0)
+    output = OutputPort("Output", float)
+
+    def process(self):
+        if self.input_value is None:
+            return
+        self.output = self.min_value + (self.max_value - self.min_value) * self.input_value
+
+
+class Softmax(Node):
+    """Apply softmax with temperature to input."""
+
+    input_data = InputPort("Input", np.ndarray)
+    temperature = InputPort("Temperature", float)
+    output = OutputPort("Output", np.ndarray)
+
+    def process(self):
+        if self.input_data is None:
+            return
+        temp = 1.0 if self.temperature is None else self.temperature
+        x = self.input_data / temp
+        x = x - np.max(x)
+        exp = np.exp(x)
+        self.output = exp / np.sum(exp)
+
+
+class FloatMath(Node):
+    """Apply a selected math operation to two floats."""
+
+    a = InputPort("A", [float, int])
+    b = InputPort("B", [float, int])
+    output = OutputPort("Output", float)
+
+    op = Enum(
+        "Operation",
+        options=["add", "sub", "mul", "div", "min", "max", "pow"],
+        default="add",
+    )
+
+    def process(self):
+        if self.a is None or self.b is None:
+            return
+        if self.op == "add":
+            self.output = self.a + self.b
+        elif self.op == "sub":
+            self.output = self.a - self.b
+        elif self.op == "mul":
+            self.output = self.a * self.b
+        elif self.op == "div":
+            self.output = self.a / (self.b + 1e-8)
+        elif self.op == "min":
+            self.output = self.a if self.a < self.b else self.b
+        elif self.op == "max":
+            self.output = self.a if self.a > self.b else self.b
+        elif self.op == "pow":
+            self.output = self.a ** self.b

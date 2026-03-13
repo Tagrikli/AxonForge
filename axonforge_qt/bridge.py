@@ -86,6 +86,7 @@ class BridgeAPI:
 
     def __init__(self) -> None:
         self.nodes: List[Node] = []
+        self._nodes_lock = threading.Lock()
         self.network: Network = Network()
         self.node_classes: Dict[str, Type[Node]] = {}
         self.node_palette: Dict[str, List[Type[Node]]] = {}
@@ -111,6 +112,7 @@ class BridgeAPI:
             max_workers=max(1, min(4, multiprocessing.cpu_count() or 1)),
             mp_context=multiprocessing.get_context("spawn"),
         )
+        self._loading_project = False
 
     # ── Initialisation ───────────────────────────────────────────────────
 
@@ -169,8 +171,13 @@ class BridgeAPI:
 
     def snapshot_displays(self) -> None:
         """Write current display outputs of every node into the shared buffer."""
+        if self._loading_project:
+            return
+        with self._nodes_lock:
+            nodes_copy = list(self.nodes)
+
         buf: Dict[str, Dict[str, Any]] = {}
-        for node in self.nodes:
+        for node in nodes_copy:
             outputs: Dict[str, Any] = {}
             for name, descriptor in getattr(node.__class__, "_outputs", {}).items():
                 try:
@@ -311,7 +318,8 @@ class BridgeAPI:
         node = node_class(x=x, y=y)
         register_node(node)
         node.validate_required_methods()
-        self.nodes.append(node)
+        with self._nodes_lock:
+            self.nodes.append(node)
 
         if getattr(node.__class__, "_uses_background_init", False):
             self._start_background_init(node)
@@ -354,7 +362,8 @@ class BridgeAPI:
                 conn["from_node"], conn["from_output"],
                 conn["to_node"], conn["to_input"],
             )
-        self.nodes = [n for n in self.nodes if n.node_id != node_id]
+        with self._nodes_lock:
+            self.nodes = [n for n in self.nodes if n.node_id != node_id]
         unregister_node(node_id)
         with self._loading_lock:
             self._node_loading_states.pop(node_id, None)
@@ -485,7 +494,8 @@ class BridgeAPI:
         self.network.start()
 
     def stop_network(self) -> None:
-        self.network.stop()
+        if self.network:
+            self.network.stop()
 
     def step_network(self) -> None:
         if self.network.running:
@@ -547,18 +557,25 @@ class BridgeAPI:
         return list(self._recent_projects)
 
     def _clear_graph_state(self) -> None:
-        with self._init_jobs_lock:
-            for future in self._pending_init_jobs.values():
-                if not future.done():
-                    future.cancel()
-            self._pending_init_jobs.clear()
-        clear_node_registry()
-        self.nodes.clear()
-        self.viewport = {"pan": {"x": 0.0, "y": 0.0}, "zoom": 1.0}
-        self.editor_state = dict(DEFAULT_EDITOR_STATE)
-        self._apply_editor_state_to_network()
-        with self._loading_lock:
-            self._node_loading_states = {}
+        self.stop_network()
+        # Wait for any ongoing network step to finish before clearing state
+        with self.network._step_lock:
+            with self._buffer_lock:
+                self._display_buffer = {}
+                self._dirty = False
+            with self._init_jobs_lock:
+                for future in self._pending_init_jobs.values():
+                    if not future.done():
+                        future.cancel()
+                self._pending_init_jobs.clear()
+            clear_node_registry()
+            with self._nodes_lock:
+                self.nodes.clear()
+            self.viewport = {"pan": {"x": 0.0, "y": 0.0}, "zoom": 1.0}
+            self.editor_state = dict(DEFAULT_EDITOR_STATE)
+            self._apply_editor_state_to_network()
+            with self._loading_lock:
+                self._node_loading_states = {}
 
     def new_project(self, project_dir: str | Path) -> None:
         project_path = Path(project_dir).expanduser().resolve()
@@ -595,13 +612,15 @@ class BridgeAPI:
                 "file": str(array_rel_path.as_posix()),
             }
 
+        with self._nodes_lock:
+            nodes_copy = list(self.nodes)
         payload = {
             "version": 4,
             "kind": "project",
             "project_name": target_dir.name,
             "viewport": self.viewport,
             "editor": self.get_editor_state(),
-            "nodes": [n.to_dict(array_serializer=_array_serializer) for n in self.nodes],
+            "nodes": [n.to_dict(array_serializer=_array_serializer) for n in nodes_copy],
             "connections": get_connections(),
         }
         project_file = target_dir / PROJECT_FILENAME
@@ -613,68 +632,73 @@ class BridgeAPI:
         self._track_recent_project(target_dir)
 
     def load_project(self, project_dir: str | Path) -> dict:
-        project_path = Path(project_dir).expanduser().resolve()
-        project_file = project_path / PROJECT_FILENAME
-        if not project_file.exists():
-            raise FileNotFoundError(f"Project not found: {project_file}")
+        self._loading_project = True
+        try:
+            project_path = Path(project_dir).expanduser().resolve()
+            project_file = project_path / PROJECT_FILENAME
+            if not project_file.exists():
+                raise FileNotFoundError(f"Project not found: {project_file}")
 
-        with open(project_file, encoding="utf-8") as f:
-            data = json.load(f)
+            with open(project_file, encoding="utf-8") as f:
+                data = json.load(f)
 
-        self._clear_graph_state()
+            self._clear_graph_state()
 
-        def _array_loader(ref: dict) -> Any:
-            ref_file = str(ref.get("file", "")).strip()
-            if not ref_file:
-                raise ValueError("Invalid ndarray_ref with empty file")
-            array_path = (project_path / ref_file).resolve()
-            try:
-                array_path.relative_to(project_path)
-            except ValueError:
-                raise ValueError(f"Invalid ndarray_ref path outside project: {ref_file}")
-            if not array_path.exists():
-                raise FileNotFoundError(f"Array file not found: {array_path}")
-            import numpy as np
-            return np.load(array_path, allow_pickle=False)
-
-        node_id_map: Dict[str, str] = {}
-        for nd in data.get("nodes", []):
-            cls = self.node_classes.get(nd.get("type"))
-            if not cls:
-                continue
-            node = cls.from_dict(nd, array_loader=_array_loader)
-            new_id = register_node(node)
-            node_id_map[nd.get("id")] = new_id
-            self.nodes.append(node)
-            if getattr(node.__class__, "_uses_background_init", False):
-                self._start_background_init(node)
-            else:
+            def _array_loader(ref: dict) -> Any:
+                ref_file = str(ref.get("file", "")).strip()
+                if not ref_file:
+                    raise ValueError("Invalid ndarray_ref with empty file")
+                array_path = (project_path / ref_file).resolve()
                 try:
-                    node.init()
-                except Exception as e:
-                    error = str(e)
-                    tb = traceback.format_exc()
-                    node._loading_error = error
-                    self._set_node_loading_state(new_id, False, error)
-                    print(f"Node init failed for {node.node_type}: {e}")
-                    print(tb)
+                    array_path.relative_to(project_path)
+                except ValueError:
+                    raise ValueError(f"Invalid ndarray_ref path outside project: {ref_file}")
+                if not array_path.exists():
+                    raise FileNotFoundError(f"Array file not found: {array_path}")
+                import numpy as np
+                return np.load(array_path, allow_pickle=False)
+
+            node_id_map: Dict[str, str] = {}
+            for nd in data.get("nodes", []):
+                cls = self.node_classes.get(nd.get("type"))
+                if not cls:
+                    continue
+                node = cls.from_dict(nd, array_loader=_array_loader)
+                new_id = register_node(node)
+                node_id_map[nd.get("id")] = new_id
+                with self._nodes_lock:
+                    self.nodes.append(node)
+                if getattr(node.__class__, "_uses_background_init", False):
+                    self._start_background_init(node)
                 else:
-                    node._loading_error = ""
-                    self._set_node_loading_state(new_id, False, "")
+                    try:
+                        node.init()
+                    except Exception as e:
+                        error = str(e)
+                        tb = traceback.format_exc()
+                        node._loading_error = error
+                        self._set_node_loading_state(new_id, False, error)
+                        print(f"Node init failed for {node.node_type}: {e}")
+                        print(tb)
+                    else:
+                        node._loading_error = ""
+                        self._set_node_loading_state(new_id, False, "")
 
-        for conn in data.get("connections", []):
-            fn = node_id_map.get(conn["from_node"])
-            tn = node_id_map.get(conn["to_node"])
-            if fn and tn:
-                add_connection(fn, conn["from_output"], tn, conn["to_input"])
+            for conn in data.get("connections", []):
+                fn = node_id_map.get(conn["from_node"])
+                tn = node_id_map.get(conn["to_node"])
+                if fn and tn:
+                    add_connection(fn, conn["from_output"], tn, conn["to_input"])
 
-        self.viewport = data.get("viewport", {"pan": {"x": 0, "y": 0}, "zoom": 1.0})
-        self.set_editor_state(data.get("editor", {}))
-        self.current_project_dir = project_path
-        self.current_workspace = project_path.name
-        self._track_recent_project(project_path)
-        self.snapshot_displays()
-        return self.viewport
+            self.viewport = data.get("viewport", {"pan": {"x": 0, "y": 0}, "zoom": 1.0})
+            self.set_editor_state(data.get("editor", {}))
+            self.current_project_dir = project_path
+            self.current_workspace = project_path.name
+            self._track_recent_project(project_path)
+            self.snapshot_displays()
+            return self.viewport
+        finally:
+            self._loading_project = False
 
     # Legacy compatibility wrappers (workspace -> project)
     def list_workspaces(self) -> List[dict]:
@@ -763,10 +787,11 @@ class BridgeAPI:
         if hasattr(old, "_output_enabled"):
             new_node._output_enabled = old._output_enabled.copy()
 
-        for i, n in enumerate(self.nodes):
-            if n.node_id == node_id:
-                self.nodes[i] = new_node
-                break
+        with self._nodes_lock:
+            for i, n in enumerate(self.nodes):
+                if n.node_id == node_id:
+                    self.nodes[i] = new_node
+                    break
 
         _node_registry[node_id] = new_node
         if new_class.__name__ in self.node_classes:
@@ -787,8 +812,10 @@ class BridgeAPI:
     # ── Topology Snapshot ────────────────────────────────────────────────
 
     def get_topology(self) -> dict:
+        with self._nodes_lock:
+            nodes_copy = list(self.nodes)
         return {
-            "nodes": [n.get_schema() for n in self.nodes],
+            "nodes": [n.get_schema() for n in nodes_copy],
             "connections": get_connections(),
             "viewport": self.viewport,
             "editor": self.get_editor_state(),
@@ -824,7 +851,7 @@ class BridgeAPI:
         return merged
 
     def _apply_editor_state_to_network(self) -> None:
-        self.network.speed = float(self.editor_state.get("max_hz_value", 60))
+        self.network.speed = float(self.editor_state.get("max_hz_value", 60.0))
         self.network.max_speed = bool(self.editor_state.get("max_hz_enabled", False))
 
     def set_editor_state(self, state: Dict[str, Any]) -> None:

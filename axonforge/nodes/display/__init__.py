@@ -4,8 +4,9 @@ import numpy as np
 
 from ...core.node import Node
 from ...core.descriptors.ports import InputPort, OutputPort
-from ...core.descriptors.properties import Float, Enum
+from ...core.descriptors.properties import Float, Enum, Bool
 from ...core.descriptors.displays import BarChart, Text, Vector2D
+from ..hypercolumn.utilities import to_display_grid
 
 
 class DisplayVector(Node):
@@ -52,6 +53,7 @@ class DisplayMatrix(Node):
         default="grayscale",
         on_change="_on_colormap_changed",
     )
+    use_grid_display = Bool("Grid Display")
 
     def _on_colormap_changed(self, new_value, old_value):
         """Called when colormap property changes, updates the display config."""
@@ -60,9 +62,10 @@ class DisplayMatrix(Node):
 
     def process(self):
         if self.input_data is not None and hasattr(self.input_data, "ndim"):
-            # Handle both 1D and 2D arrays
-            if self.input_data.ndim == 1:
+            data = self.input_data
+            if bool(self.use_grid_display):
+                data = to_display_grid(data)
+            elif data.ndim == 1:
                 # Reshape 1D to 2D (single row)
-                self.display = self.input_data.reshape(1, -1)
-            elif self.input_data.ndim == 2:
-                self.display = self.input_data
+                data = data.reshape(1, -1)
+            self.display = data

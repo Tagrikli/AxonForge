@@ -71,6 +71,8 @@ class ConsolePanel(QWidget):
         super().__init__(parent)
         self.bridge = bridge
         self.setObjectName("console_panel")
+        self._disposed = False
+        self._pending_blocks: list[tuple[list[str], bool]] = []
         
         # Maximum number of lines to keep
         self._max_lines = 1000
@@ -87,7 +89,10 @@ class ConsolePanel(QWidget):
         self._apply_styling()
         
         # Connect signal for thread-safe updates
-        self.message_received.connect(self._on_message_received)
+        self.message_received.connect(
+            self._on_message_received,
+            Qt.ConnectionType.QueuedConnection,
+        )
         
         # Start capturing output
         self._start_capture()
@@ -216,21 +221,33 @@ class ConsolePanel(QWidget):
     
     def _on_stream_output(self, text: str, is_error: bool) -> None:
         """Handle output from the stream wrappers."""
+        if self._disposed:
+            return
         # Use signal for thread-safe GUI updates
         self.message_received.emit(text, is_error)
     
     def _on_message_received(self, text: str, is_error: bool) -> None:
         """Process received message (runs in GUI thread via signal)."""
+        if self._disposed:
+            return
         lines = text.split('\n')
         if lines and lines[-1] == "":
             lines = lines[:-1]
         if not lines or all(line.strip() == "" for line in lines):
             return
+        if not self.isVisible():
+            self._pending_blocks.append((lines, is_error))
+            return
         self._append_message_block(lines, is_error)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._pending_blocks:
+            QTimer.singleShot(0, self._flush_pending_blocks)
 
     def _append_message_block(self, lines: list[str], is_error: bool = False) -> None:
         """Append a multiline message block."""
-        if not lines:
+        if not lines or self._disposed:
             return
 
         cursor = self._text_edit.textCursor()
@@ -261,6 +278,14 @@ class ConsolePanel(QWidget):
 
         self._text_edit.setTextCursor(cursor)
         self._text_edit.ensureCursorVisible()
+
+    def _flush_pending_blocks(self) -> None:
+        if self._disposed or not self.isVisible() or not self._pending_blocks:
+            return
+        pending = self._pending_blocks
+        self._pending_blocks = []
+        for lines, is_error in pending:
+            self._append_message_block(lines, is_error)
 
     def _build_prompt_prefix(self, is_error: bool) -> str:
         """Build console prompt prefix like <user>@<project> >."""
@@ -379,6 +404,8 @@ class ConsolePanel(QWidget):
     
     def closeEvent(self, event) -> None:
         """Clean up when the panel is closed."""
+        self._disposed = True
+        self._pending_blocks.clear()
         self._stop_capture()
         if self._flush_timer:
             self._flush_timer.stop()

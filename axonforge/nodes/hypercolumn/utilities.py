@@ -67,3 +67,15 @@ def scale_to_bwr(arr):
 
     # Scale to [-1, 1]: 2 * (x - min) / (max - min) - 1
     return 2 * (arr - min_val) / (max_val - min_val) - 1
+
+def softmax(arr, axis=-1, temperature=1.0):
+    """Numerically stable softmax with temperature scaling."""
+    arr = np.asarray(arr)
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    arr = arr / float(temperature)
+    max_val = np.max(arr, axis=axis, keepdims=True)
+    shifted = arr - max_val
+    exp = np.exp(shifted)
+    sum_exp = np.sum(exp, axis=axis, keepdims=True)
+    return exp / sum_exp

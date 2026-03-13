@@ -2,9 +2,11 @@
 EditorView — QGraphicsView with pan, zoom, and grid background.
 """
 
-from PySide6.QtCore import Qt, QPointF, Signal
+import os
+from datetime import datetime
+from PySide6.QtCore import Qt, QPointF, Signal, QRectF
 from typing import Optional
-from PySide6.QtGui import QPainter, QPen, QColor, QWheelEvent, QMouseEvent, QKeyEvent, QCursor
+from PySide6.QtGui import QPainter, QPen, QColor, QWheelEvent, QMouseEvent, QKeyEvent, QCursor, QImage
 from PySide6.QtWidgets import QGraphicsView, QGraphicsProxyWidget, QApplication
 
 from .editor_scene import EditorScene
@@ -52,6 +54,11 @@ class EditorView(QGraphicsView):
         self.setSceneRect(-50000, -50000, 100000, 100000)
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
+
+    def set_editor_scene(self, scene: EditorScene) -> None:
+        """Swap the active editor scene while keeping view state intact."""
+        self._scene = scene
+        self.setScene(scene)
 
     # ── Grid background ──────────────────────────────────────────────────
 
@@ -230,6 +237,49 @@ class EditorView(QGraphicsView):
         self._zoom = self.transform().m11()
         self.zoom_changed.emit(self._zoom)
 
+    def export_screenshot(self) -> None:
+        """Capture the entire scene and save it to the project's data/screenshots folder."""
+        # 1. Determine save directory
+        # Try to get the current project directory from the bridge
+        project_dir = getattr(self._scene.bridge, "current_project_dir", None)
+        if project_dir:
+            # Save under project_dir/data/screenshots
+            save_dir = os.path.join(str(project_dir), "data", "screenshots")
+        else:
+            # Fallback to root data/screenshots if no project is loaded
+            save_dir = os.path.join(os.getcwd(), "data", "screenshots")
+            
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 2. Generate filename: yyMMdd_HHmmss.png
+        filename = datetime.now().strftime("%y%m%d_%H%M%S") + ".png"
+        file_path = os.path.join(save_dir, filename)
+
+        # 3. Determine the area containing all nodes
+        rect = self.scene().itemsBoundingRect()
+        if rect.isEmpty():
+            return
+        
+        # Add padding
+        rect.adjust(-50, -50, 50, 50)
+
+        # 4. Create the image
+        image = QImage(rect.size().toSize(), QImage.Format.Format_ARGB32)
+        image.fill(BG_PRIMARY)
+
+        # 5. Render
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.scene().render(painter, target=QRectF(image.rect()), source=rect)
+        painter.end()
+
+        # 6. Save
+        # Passing None for format allows Qt to infer it from the file extension (.png)
+        if image.save(file_path):
+            print(f"Screenshot saved to: {file_path}")
+        else:
+            print(f"Failed to save screenshot to: {file_path}")
+
     # ── Keyboard ─────────────────────────────────────────────────────────
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
@@ -251,6 +301,12 @@ class EditorView(QGraphicsView):
         if event.key() == Qt.Key.Key_Space and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             event.ignore()
             return
+        # CTRL+P -> export screenshot
+        if event.key() == Qt.Key.Key_P and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.export_screenshot()
+            event.accept()
+            return
+
         # Shift+A -> quick add popup at mouse position
         if event.key() == Qt.Key.Key_A and event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
             global_pos = QCursor.pos()

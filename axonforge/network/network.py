@@ -1,6 +1,7 @@
 from typing import List, Optional, Dict, Any, Tuple, Set
 import numpy as np
 import traceback
+import threading
 
 
 class NetworkError(Exception):
@@ -21,13 +22,16 @@ class Network:
     
     def __init__(self):
         self.running = False
-        self.speed = 60
+        self.speed: float = 60.0
         self.max_speed = False
+        self.actual_hz = 0.0
+        self.instant_hz = 0.0
         self._step_count = 0
         self._signals_now: Dict[Tuple[str, str], Any] = {}
         self.last_error: Optional[NetworkError] = None
         self.failed_nodes: Set[str] = set()  # Track nodes that failed processing
         self.failed_node_errors: Dict[str, str] = {}  # node_id -> latest error message
+        self._step_lock = threading.Lock()
     
     def start(self):
         self.running = True
@@ -52,8 +56,9 @@ class Network:
         
         Raises NetworkError if any node fails, and stops the network.
         """
-        nodes_by_id = get_all_nodes()
-        connections = get_connections()
+        with self._step_lock:
+            nodes_by_id = get_all_nodes()
+            connections = get_connections()
         
         # Build incoming port mappings
         incoming: Dict[str, Dict[str, Tuple[str, str]]] = {}

@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QEvent
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
-    QPushButton, QFileDialog, QSplitter, QCheckBox, QSpinBox,
+    QPushButton, QFileDialog, QSplitter, QCheckBox, QSpinBox, QMessageBox,
 )
 
 from .bridge import BridgeAPI
@@ -31,6 +31,10 @@ class MainWindow(QMainWindow):
         self._console_last_height = 220
         self._console_collapsed = False
         self._syncing_editor_state = False
+        self._viewport_apply_token = 0
+        self._project_transition_active = False
+        self._window_closing = False
+        self._retired_scenes: list[EditorScene] = []
         self._resize_anchor_horizontal: tuple[QPoint, QPointF] | None = None
         self._resize_anchor_vertical: tuple[QPoint, QPointF] | None = None
         self._shortcuts: list[QShortcut] = []
@@ -138,6 +142,12 @@ class MainWindow(QMainWindow):
         self._save_project_action.triggered.connect(self._save_project)
         file_menu.addAction(self._save_project_action)
 
+        self._close_project_action = QAction("Close Project", self)
+        self._close_project_action.triggered.connect(
+            lambda checked=False: QTimer.singleShot(0, self._close_project)
+        )
+        file_menu.addAction(self._close_project_action)
+
         file_menu.addSeparator()
         self._recent_projects_menu = file_menu.addMenu("Recent Projects")
         self._recent_projects_menu.aboutToShow.connect(self._refresh_recent_projects_menu)
@@ -209,7 +219,6 @@ class MainWindow(QMainWindow):
 
     def _update_project_ui(self) -> None:
         self._workspace_label.setText(self._project_display_name())
-        self._refresh_recent_projects_menu()
 
     def _refresh_recent_projects_menu(self) -> None:
         self._recent_projects_menu.clear()
@@ -222,12 +231,19 @@ class MainWindow(QMainWindow):
 
         for project_path in projects:
             action = QAction(project_path, self)
-            action.triggered.connect(lambda checked=False, p=project_path: self._load_project(p))
+            # Use QTimer.singleShot to defer loading. This prevents a crash where the
+            # QAction (the sender) is deleted by _refresh_recent_projects_menu()
+            # while its triggered signal is still being handled.
+            action.triggered.connect(
+                lambda checked=False, p=project_path: QTimer.singleShot(0, lambda: self._load_project(p))
+            )
             self._recent_projects_menu.addAction(action)
 
     # ── UI refresh ───────────────────────────────────────────────────────
 
     def _on_refresh_tick(self) -> None:
+        if self._project_transition_active or self._window_closing:
+            return
         self.bridge.poll_background_init_jobs()
         buf = self.bridge.read_display_buffer()
         if buf is not None:
@@ -415,16 +431,111 @@ class MainWindow(QMainWindow):
 
     # ── Project ─────────────────────────────────────────────────────────
 
+    def _begin_project_transition(self) -> None:
+        """Stop background activity before tearing down project state."""
+        if self._project_transition_active:
+            return
+        self._project_transition_active = True
+        self._viewport_apply_token += 1
+        self._refresh_timer.stop()
+        self._refresh_timer.blockSignals(True)
+        if self._comp_thread.isRunning():
+            self._comp_thread.request_stop()
+            self._comp_thread.wait()
+
+    def _end_project_transition(self) -> None:
+        """Restart background activity after project state is ready."""
+        if not self._project_transition_active:
+            return
+        if self._window_closing:
+            old_thread = self._comp_thread
+            self._project_transition_active = False
+            try:
+                old_thread.deleteLater()
+            except Exception:
+                pass
+            return
+        old_thread = self._comp_thread
+        self._comp_thread = ComputationThread(self.bridge)
+        self._comp_thread.network_error.connect(self._on_network_error)
+        self._comp_thread.start()
+        self._project_transition_active = False
+        self._refresh_timer.blockSignals(False)
+        self._refresh_timer.start(int(1000.0 / self._ui_fps))
+        try:
+            old_thread.deleteLater()
+        except Exception:
+            pass
+
+    def _rebuild_scene(self, topology: dict) -> None:
+        """Swap in a fresh scene, then dispose the old one after detaching it."""
+        self._view.setUpdatesEnabled(False)
+        self._view.viewport().setUpdatesEnabled(False)
+
+        old_scene = self._scene
+        new_scene = EditorScene(self.bridge)
+        new_scene.rebuild_from_topology(topology)
+        self._scene = new_scene
+        self._view.set_editor_scene(new_scene)
+
+        try:
+            old_scene.deactivate()
+        except Exception:
+            pass
+        self._retired_scenes.append(old_scene)
+
+        self._view.viewport().setUpdatesEnabled(True)
+        self._view.setUpdatesEnabled(True)
+        self._view.viewport().update()
+        self._view.update()
+
+    def _close_project_impl(self) -> None:
+        """Clear all project state and rebuild an empty scene."""
+        self.bridge.clear_workspace()
+        topology = self.bridge.get_topology()
+        self._rebuild_scene(topology)
+        self._update_project_ui()
+
+    def _autosave_current_project(self) -> None:
+        """Persist the current saved project before switching away from it."""
+        target_dir = self.bridge.current_project_dir
+        if target_dir is None:
+            return
+        self._snapshot_viewport_state()
+        self._snapshot_editor_state()
+        self.bridge.save_project(target_dir)
+
+    def _close_project(self) -> None:
+        try:
+            self._autosave_current_project()
+        except Exception as e:
+            print(f"Failed to save project before close: {e}")
+        self._begin_project_transition()
+        try:
+            # Avoid resetting the view during close; it can crash during teardown.
+            self._close_project_impl()
+        finally:
+            self._end_project_transition()
+
     def _load_project(self, project_dir: str) -> None:
         try:
+            self._autosave_current_project()
+        except Exception as e:
+            print(f"Failed to save project before load: {e}")
+        self._begin_project_transition()
+        try:
+            # Close current project before loading a new one
+            self._close_project_impl()
             self.bridge.load_project(project_dir)
             topology = self.bridge.get_topology()
-            self._scene.rebuild_from_topology(topology)
-            self._apply_viewport_state(topology.get("viewport", {}))
+            self._rebuild_scene(topology)
+            self._schedule_viewport_state(topology.get("viewport", {}))
             self._update_project_ui()
             self._apply_editor_state()
         except Exception as e:
             print(f"Failed to load project: {e}")
+        finally:
+            self._end_project_transition()
 
     def _load_project_dialog(self) -> None:
         project_dir = QFileDialog.getExistingDirectory(
@@ -451,12 +562,27 @@ class MainWindow(QMainWindow):
         project_dir = QFileDialog.getExistingDirectory(self, "New Project")
         if not project_dir:
             return
-        self.bridge.new_project(project_dir)
-        topology = self.bridge.get_topology()
-        self._scene.rebuild_from_topology(topology)
-        self._apply_viewport_state(topology.get("viewport", {}))
-        self._update_project_ui()
-        self._apply_editor_state()
+
+        try:
+            self._autosave_current_project()
+        except Exception as e:
+            print(f"Failed to save project before creating a new one: {e}")
+        self._begin_project_transition()
+        try:
+            # Close current project before creating a new one
+            self._close_project_impl()
+            self.bridge.new_project(project_dir)
+            topology = self.bridge.get_topology()
+            self._rebuild_scene(topology)
+            self._schedule_viewport_state(topology.get("viewport", {}))
+            self._update_project_ui()
+            self._apply_editor_state()
+            self._snapshot_viewport_state()
+            self._snapshot_editor_state()
+            self.bridge.save_project(project_dir)
+            self._update_project_ui()
+        finally:
+            self._end_project_transition()
 
     def _snapshot_viewport_state(self) -> None:
         viewport = self._view.viewport()
@@ -466,6 +592,26 @@ class MainWindow(QMainWindow):
             "pan": {"x": float(center_scene.x()), "y": float(center_scene.y())},
             "zoom": float(self._view.current_zoom),
         }
+
+    def _schedule_viewport_state(self, viewport_state: dict) -> None:
+        """Apply viewport state after the view/scene swap has settled."""
+        self._viewport_apply_token += 1
+        token = self._viewport_apply_token
+
+        def _apply() -> None:
+            if token != self._viewport_apply_token:
+                return
+            if self._view is None or self._scene is None:
+                return
+            if self._view.scene() is not self._scene:
+                QTimer.singleShot(0, _apply)
+                return
+            if not self._view.isVisible():
+                QTimer.singleShot(50, _apply)
+                return
+            self._apply_viewport_state(viewport_state)
+
+        QTimer.singleShot(0, _apply)
 
     def _apply_viewport_state(self, viewport_state: dict) -> None:
         pan = viewport_state.get("pan", {}) if isinstance(viewport_state, dict) else {}
@@ -583,8 +729,27 @@ class MainWindow(QMainWindow):
     # ── Cleanup ──────────────────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
-        self._refresh_timer.stop()
-        self._comp_thread.request_stop()
-        self._comp_thread.wait(2000)
+        self._window_closing = True
+        if self.bridge.current_project_dir is None:
+            result = QMessageBox.question(
+                self,
+                "Unsaved Project",
+                "This project has not been saved. Are you sure you want to close?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                self._window_closing = False
+                event.ignore()
+                return
+        else:
+            try:
+                self._snapshot_viewport_state()
+                self._snapshot_editor_state()
+                self.bridge.save_project(self.bridge.current_project_dir)
+            except Exception as e:
+                print(f"Failed to save project on close: {e}")
+
+        self._begin_project_transition()
         self.bridge.shutdown_background_workers()
         super().closeEvent(event)
