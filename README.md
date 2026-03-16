@@ -1,7 +1,5 @@
 <p align="center">
-  <video src="data/media_github/axonforge.mp4" controls width="720">
-    <a href="data/media_github/axonforge.mp4">Watch the AxonForge demo</a>
-  </video>
+  <img src="data/media_github/axonforge.gif" alt="AxonForge demo" width="720">
 </p>
 
 <h1 align="center">AxonForge</h1>
