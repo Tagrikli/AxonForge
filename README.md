@@ -5,336 +5,261 @@
 <h1 align="center">AxonForge</h1>
 
 <p align="center">
-  <strong>A node-based computational framework with a PySide6 visual editor</strong>
+  <strong>A node-based computational framework for prototyping algorithms that evolve over time.</strong>
 </p>
 
 <p align="center">
-  <em>Define computational nodes in Python, connect them visually, and run the graph live.</em>
+  Wire nodes, connect feedback loops, tweak parameters live, and watch your system converge — all without leaving the canvas.
 </p>
 
 ---
 
-## Overview
+## Why AxonForge?
 
-AxonForge is a desktop node editor and runtime for building computational graphs. It is designed as a personal lab environment where research projects live in their own directories, completely separate from the framework source.
+Most dataflow tools force you into directed acyclic graphs. Most simulators lock you into a specific model family. AxonForge does neither.
 
-Core ideas:
+It gives you a **live, visual graph** where every node is a plain Python class, connections can form cycles, and execution ticks forward one step at a time — making feedback, recurrence, and iterative learning first-class concepts.
 
-- Declarative node classes using descriptors (`InputPort`, `OutputPort`, `Field`, `State`, `Display`, etc.)
-- Real-time PySide6 graph editor
-- Topological network execution with runtime error reporting
-- CLI-driven project workflow (`axonforge init` / `axonforge run`)
-- Project-local custom nodes discovered alongside built-in ones
-- Multiple graphs per project, managed via a right-side panel
-- Hot reload for dynamic nodes
+**Designed for computational neuroscience prototyping. General enough for any iterative computation.**
 
----
+### What sets it apart
 
-## Documentation
-
-- [Node Authoring Guide](docs/node_authoring_guide.md): comprehensive reference for building nodes, including lifecycle, decorators, fields, displays, actions, and state.
-- [Autonomous Node Generation Guide](docs/autonomous_node_generation.md): workflow, templates, and verification checklist for reliably generating nodes with an LLM agent.
-
-For installed-package usage outside this repo:
-
-```bash
-axonforge docs agent
-axonforge docs template
-axonforge docs fields
-```
-
-Docs topics:
-
-- `agent`: compact authoring rules and workflow for LLM agents and external users
-- `template`: a copy-pasteable starter node
-- `fields`: field descriptor reference and constructor summary
-
-For machine-readable output:
-
-```bash
-axonforge docs agent --json
-axonforge docs fields --json
-```
-
-### Validation
-
-You can validate a node definition from the terminal without opening the GUI:
-
-```bash
-axonforge validate-node path/to/node.py
-```
-
-For machine-readable output:
-
-```bash
-axonforge validate-node path/to/node.py --json
-```
-
-For project-local nodes, run it from the project root or pass `--project-dir` explicitly.
-
-You can also audit declared package dependencies against current repo imports:
-
-```bash
-python utils/audit_dependencies.py
-python utils/audit_dependencies.py --fail-on-unused
-```
+- **Feedback-native execution** — Topological sort with cycle-aware semantics. Recurrent connections deliver previous-step values automatically. No delay nodes, no workarounds.
+- **Declarative node API** — A node is a Python class with descriptors. Ports, fields, displays, state — all declared as class attributes. Minimal boilerplate, maximum clarity.
+- **Live parameter tuning** — Sliders, toggles, enums, and file pickers rendered directly in each node. Change a value, see the effect immediately.
+- **Real-time visualization** — Heatmaps, plots, images, and text displays embedded in nodes. Watch weights organize, activations sharpen, and losses drop as the graph runs.
+- **Hot-reloadable nodes** — Edit your node's source, hit reload. Field values preserved, code updated, no restart needed.
+- **Project-local architecture** — Your research lives in its own directory with its own nodes, graphs, and data. The framework stays separate. Move your project, share it, version it independently.
 
 ---
 
-## Installation
+## Use Cases
 
-### Prerequisites
+**Computational neuroscience** — Prototype bio-inspired learning rules, lateral inhibition, population codes, and cortical models with feedback loops between layers.
 
-- Python 3.12+
-- Linux/macOS/Windows with Qt support for PySide6
+**Dynamical systems** — Build and observe systems with recurrent dynamics: oscillators, attractors, coupled differential equations, control loops.
 
-### Install
+**Signal processing** — Chain transforms, filters, and analysis nodes into live pipelines with immediate visual feedback.
 
-```bash
-git clone https://github.com/your-username/AxonForge.git
-cd AxonForge
-
-# using uv
-uv sync
-
-# or using pip (editable install recommended for development)
-pip install -e .
-```
-
-The editable install (`-e`) means changes to the framework source are reflected immediately in all environments that installed it -- no reinstall needed.
-
----
-
-## Workflow
-
-### 1. Initialize a project
-
-```bash
-mkdir ~/research/my-experiment
-cd ~/research/my-experiment
-axonforge init --name "my-experiment"
-```
-
-This creates the project scaffold:
-
-```
-my-experiment/
-├── nodes/           <- place custom node files here
-├── graphs/          <- node graphs are saved here
-├── data/            <- numpy array storage
-└── axonforge.json   <- project metadata
-```
-
-Built-in MNIST/Fashion-MNIST input nodes do not store datasets in the project folder. They download and cache dataset files under the user's cache directory on first use.
-
-### 2. Run the editor
-
-```bash
-# Open with empty canvas
-axonforge run
-
-# Open a specific graph
-axonforge run training
-```
-
-The app launches scoped to the current directory. It discovers both built-in nodes and any custom nodes in your project's `nodes/` folder.
-
-### 3. Work with graphs
-
-- **Shift+E** toggles the graph panel (right-side drawer)
-- Click a graph name to switch to it
-- Click **+** or press **Ctrl+N** to create a new unnamed graph
-- **Ctrl+S** saves the current graph. Unnamed graphs are named inline from the graph drawer.
-- Graphs auto-save when switching or closing the app
+**Algorithm design** — Explore iterative algorithms step by step. Decompose complex computations into inspectable, rewirable stages.
 
 ---
 
 ## Quick Start
 
-1. Initialize a project with `axonforge init`.
-2. Run `axonforge run` from the project directory.
-3. Add nodes: drag from the palette drawer (`Shift+Q`), or press `Shift+A` to search.
-4. Connect ports by dragging between them.
-5. Set node properties inline.
-6. Start the network with `Ctrl+Space` or step with `Ctrl+Return`.
-7. Save your graph with `Ctrl+S`.
+```bash
+# Install
+git clone https://github.com/your-username/AxonForge.git
+cd AxonForge
+uv sync            # or: pip install -e .
+
+# Create a project
+mkdir ~/research/my-experiment && cd ~/research/my-experiment
+axonforge init --name "my-experiment"
+
+# Launch the editor
+axonforge run
+```
+
+This gives you:
+
+```
+my-experiment/
+├── nodes/           ← your custom node files (auto-discovered)
+├── graphs/          ← saved computational graphs
+├── data/            ← numpy array storage
+└── axonforge.json   ← project metadata
+```
+
+### First steps on the canvas
+
+1. Open the node palette with **Shift+Q**, or search nodes with **Shift+A**.
+2. Drag nodes onto the canvas and connect ports by dragging between them.
+3. Set parameters inline — sliders, toggles, dropdowns right on the node.
+4. Run the graph with **Ctrl+Space** (continuous) or **Ctrl+Return** (single step).
+5. Save with **Ctrl+S**.
 
 ---
 
-## Controls
+## Defining a Node
 
-| Shortcut / Action | Behavior |
-|---|---|
-| `Ctrl+Space` | Start/stop network |
-| `Ctrl+Return` | Single network step |
-| `Ctrl+S` | Save graph |
-| `Shift+E` | Toggle graph panel |
-| `Shift+A` | Open quick-add node picker |
-| `Shift+D` | Duplicate selected node(s) |
-| `Shift+Q` | Toggle node palette drawer |
-| `Shift+W` | Toggle console |
-| `Shift+X` | Delete selected node(s) or the hovered connection |
-| Mouse wheel | Zoom |
-| Middle mouse drag | Pan |
-
----
-
-## Defining Nodes
-
-Nodes are normal Python classes inheriting from `Node`. Place them in your project's `nodes/` folder and they will be auto-discovered.
+Nodes are Python classes. Drop them in your project's `nodes/` folder and they appear in the palette automatically.
 
 ```python
 import numpy as np
-
-from axonforge.core.node import Node, background_init
+from axonforge.core.node import Node
 from axonforge.core.descriptors import branch
 from axonforge.core.descriptors.ports import InputPort, OutputPort
-from axonforge.core.descriptors.fields import (
-    Bool,
-    DirectoryPath,
-    Enum,
-    FilePath,
-    FilePaths,
-    Integer,
-    Range,
-)
+from axonforge.core.descriptors.fields import Range, Bool
 from axonforge.core.descriptors.displays import Heatmap, Text
 from axonforge.core.descriptors.actions import Action
 from axonforge.core.descriptors.state import State
 
 
-@branch("Demo/Examples")
-class ExampleNode(Node):
-    # Ports: receive/send graph data
-    x = InputPort("X", np.ndarray)
-    y = OutputPort("Y", np.ndarray)
+@branch("Demo")
+class LeakyIntegrator(Node):
+    """A simple leaky integrator with adjustable decay."""
 
-    # Fields: user-editable controls in the node
-    gain = Range("Gain", 1.0, 0.0, 5.0)
-    steps = Integer("Steps", 1)
-    enabled = Bool("Enabled", True)
-    mode = Enum("Mode", ["a", "b"], "a")
-    config_file = FilePath("Config File")
-    dataset_dir = DirectoryPath("Dataset Dir")
-    inputs = FilePaths("Input Files")
+    signal = InputPort("Signal", np.ndarray)
+    output = OutputPort("Output", np.ndarray)
 
-    # Displays: visual outputs rendered in the node body
-    preview = Heatmap("Preview", colormap="grayscale", scale_mode="auto")
-    info = Text("Info", default="ready")
+    decay = Range("Decay", default=0.9, min_val=0.0, max_val=1.0, step=0.01)
+    enabled = Bool("Enabled", default=True)
 
-    # Action button: calls _reset when clicked
-    reset = Action("Reset", lambda self, params=None: self._reset(params))
+    preview = Heatmap("State", colormap="viridis")
+    info = Text("Info", default="idle")
 
-    # State: persistent internal value saved/loaded with graph
-    counter = State(default=0)
+    reset = Action("Reset", lambda self, p=None: self._reset(p))
+    accumulator = State(default=None)
 
-    # Optional: run in background worker process
-    @background_init
     def init(self):
-        self.counter = 0
+        self.accumulator = None
 
     def process(self):
-        if self.x is None or not self.enabled:
+        if self.signal is None or not self.enabled:
             return
-        self.y = self.x * float(self.gain)
-        self.preview = self.y
-        self.counter += 1
-        self.info = f"ticks={self.counter}, mode={self.mode}"
+        x = np.asarray(self.signal, dtype=np.float64)
+        if self.accumulator is None:
+            self.accumulator = np.zeros_like(x)
+        self.accumulator = float(self.decay) * self.accumulator + x
+        self.output = self.accumulator
+        self.preview = self.accumulator
+        self.info = f"peak={self.accumulator.max():.3f}"
 
     def _reset(self, params=None):
-        self.counter = 0
+        self.accumulator = None
 ```
 
-`FilePath` and `DirectoryPath` load as `Path | None`, and `FilePaths` loads as `list[Path]`. When saved paths live inside the current project, they are written relative to the project root so moving the project keeps those references valid.
+That's it. Ports define data flow. Fields give you live controls. Displays show results. State persists across steps. The `@branch` decorator sets the palette category — or omit it and the folder structure is used instead.
 
-The `@branch("Category/Subcategory")` decorator determines where the node appears in the palette. If omitted, the category is inferred from the folder structure.
+---
+
+## Built-in Node Library
+
+AxonForge ships with a few ready to use nodes:
+
+| Category | Nodes |
+|---|---|
+| **Math** | Arithmetic, comparison, trigonometry |
+| **Linear Algebra** | Vector ops, matrix ops, SVD, eigen decomposition, QR |
+| **Statistics** | Mean, std, variance, correlation, histogram, argmax/argmin |
+| **Information Theory** | Entropy, KL divergence, mutual information, cross-entropy |
+| **Noise** | Gaussian, uniform, Perlin, Worley, blue noise, salt & pepper |
+| **Input** | Image loader, rotating line, moving shape, MNIST/Fashion-MNIST |
+| **Encoding** | One-hot, sparse hash, unit-vector hash, spatial encoders |
+| **Display** | Heatmap, vector plot, image viewer, line/bar charts |
+| **Utilities** | Softmax, top-K, Jaccard index, range mapping, sliders |
+
+All nodes are composable — connect any compatible ports and build your pipeline.
+
+---
+
+## How Execution Works
+
+Each tick of the graph:
+
+1. **Topological sort** orders nodes by dependency (Kahn's algorithm).
+2. Nodes in cycles are placed last — their inputs carry **previous-step values**, giving you implicit feedback with one-step delay.
+3. Each node's `process()` runs in order: read inputs, compute, write outputs.
+4. Displays update in real-time on the canvas.
+
+This means feedback connections just work. Wire a node's output back to an earlier node's input, and the graph becomes recurrent — no special configuration needed.
+
+---
+
+## Controls
+
+| Shortcut | Action |
+|---|---|
+| **Ctrl+Space** | Start / stop the graph |
+| **Ctrl+Return** | Single step |
+| **Ctrl+S** | Save graph |
+| **Ctrl+N** | New graph |
+| **Shift+A** | Quick-add node search |
+| **Shift+Q** | Toggle node palette |
+| **Shift+E** | Toggle graph panel |
+| **Shift+D** | Duplicate selected nodes |
+| **Shift+W** | Toggle console |
+| **Shift+X** | Delete selection / hovered connection |
+| Mouse wheel | Zoom |
+| Middle drag | Pan |
+
+---
+
+## Documentation
+
+- [Node Authoring Guide](docs/node_authoring_guide.md) — Complete reference for building nodes: lifecycle, descriptors, fields, displays, actions, and state.
+- [Autonomous Node Generation Guide](docs/autonomous_node_generation.md) — Templates and workflow for generating nodes with LLM agents.
+
+From the terminal:
+
+```bash
+axonforge docs agent       # Authoring rules (compact, LLM-friendly)
+axonforge docs template    # Copy-pasteable starter node
+axonforge docs fields      # Field descriptor reference
+```
+
+Validate a node without opening the editor:
+
+```bash
+axonforge validate-node path/to/node.py
+```
 
 ---
 
 ## Project Structure
 
-Each project directory contains:
-
 ```
 my-project/
-├── axonforge.json       <- project marker and metadata
-├── nodes/               <- custom node .py files (auto-discovered)
-├── graphs/              <- graph JSON files
+├── axonforge.json       ← project metadata
+├── nodes/               ← custom nodes (auto-discovered on launch)
+├── graphs/              ← graph definitions (JSON, v5)
 │   ├── training.json
 │   └── evaluation.json
-└── data/                <- shared numpy arrays (.npy)
+└── data/                ← numpy arrays (.npy, shared across graphs)
 ```
 
-### Graph file format (v5)
-
-```json
-{
-  "version": 5,
-  "kind": "graph",
-  "name": "training",
-  "viewport": {
-    "pan": {"x": 12.3, "y": -45.6},
-    "zoom": 1.2
-  },
-  "editor": {
-    "drawer_collapsed": true,
-    "drawer_width": 260,
-    "console_collapsed": false,
-    "console_height": 220,
-    "max_hz_enabled": false,
-    "max_hz_value": 60
-  },
-  "nodes": [...],
-  "connections": [...]
-}
-```
-
-Arrays are stored as `.npy` files in `data/` with UUID filenames, shared across all graphs in a project.
-
----
-
-## Console and Logging
-
-- Console lines are prefixed with `<user>@<project> >` (or `!>` for error stream).
-- Multi-line tracebacks are colorized by line type.
-
----
-
-## Runtime Notes
-
-- Network execution uses topological ordering with cycle fallback semantics.
-- Signals are passed by reference (no defensive clone in runtime).
-  - Avoid in-place mutation of shared input objects unless intended.
-- Process errors stop the network and mark failing nodes.
+Graphs are self-contained JSON files. Arrays are stored externally as `.npy` with UUID filenames. Path references inside graphs are project-relative, so you can move or share the whole directory.
 
 ---
 
 ## Architecture
 
-```text
-axonforge/                   <- Core framework
-  cli.py                     <- CLI entry point (init, run)
-  core/
-    node.py
-    registry.py
-    descriptors/
-  network/
-    network.py
-  nodes/                     <- Built-in node modules
-    ...
-
-axonforge_qt/                <- PySide6 GUI
-  main.py
-  main_window.py
-  bridge.py
-  computation_thread.py
-  canvas/
-  panels/
-    palette.py               <- Left drawer: node palette
-    graph_panel.py           <- Right drawer: graph management
-    console.py
-  themes/
 ```
+axonforge/               ← Core (pure Python, no GUI dependency)
+  core/
+    node.py              ← Node base class, metaclass
+    registry.py          ← Thread-safe node & connection registry
+    descriptors/         ← Ports, fields, displays, actions, state
+  network/
+    network.py           ← Execution engine, topological sort
+  nodes/                 ← Built-in node library
+  cli.py                 ← CLI entry point
+
+axonforge_qt/            ← Visual editor (PySide6)
+  bridge.py              ← API between engine and GUI
+  canvas/                ← Graph canvas and node rendering
+  panels/                ← Palette, graph manager, console
+```
+
+The core framework has no GUI dependency. The visual editor is a separate layer built with PySide6.
+
+---
+
+## Runtime Notes
+
+- Signals are passed by reference for performance. Avoid in-place mutation of inputs unless intended.
+- Process errors stop the network and highlight the failing node with full traceback.
+- Background initialization (`@background_init`) runs heavy setup in a worker process without blocking the UI.
+- Built-in dataset nodes (MNIST, Fashion-MNIST) cache downloads in the user's cache directory, not in the project.
+
+---
+
+## Requirements
+
+- Python 3.12+
+- PySide6 (for the visual editor)
+- NumPy
 
 ---
 
