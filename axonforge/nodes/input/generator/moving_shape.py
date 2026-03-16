@@ -4,10 +4,10 @@ import numpy as np
 
 from ....core.node import Node
 from ....core.descriptors.ports import InputPort, OutputPort
-from ....core.descriptors.properties import Range, Integer, Bool, Enum
-from ....core.descriptors.displays import Vector2D, Text
+from ....core.descriptors.fields import Range, Integer, Bool, Enum
+from ....core.descriptors.displays import Heatmap, Text
 from ....core.descriptors.actions import Action
-from ....core.descriptors.store import Store
+from ....core.descriptors.state import State
 from ....core.descriptors import branch
 
 
@@ -15,7 +15,7 @@ class InputMovingShape(Node):
     """Generate a moving shape (square or circle) on a 2D grid."""
 
     output_pattern = OutputPort("Pattern", np.ndarray)
-    pattern = Vector2D("Pattern", color_mode="grayscale")
+    pattern = Heatmap("Pattern", colormap="grayscale")
     info = Text("Info", default="Position: (0, 0)")
 
     # Properties
@@ -29,14 +29,14 @@ class InputMovingShape(Node):
     auto_move = Bool("Auto Move", default=False)
 
     # Buttons
-    prev_pos = Action("Prev", callback="_on_prev")
-    next_pos = Action("Next", callback="_on_next")
+    prev_pos = Action("Prev", lambda self, params=None: self._on_prev(params))
+    next_pos = Action("Next", lambda self, params=None: self._on_next(params))
 
-    # Store
-    pos_x = Store(default=0.0)
-    pos_y = Store(default=0.0)
-    target_x = Store(default=0.0)
-    target_y = Store(default=0.0)
+    # State
+    pos_x = State(default=0.0)
+    pos_y = State(default=0.0)
+    target_x = State(default=0.0)
+    target_y = State(default=0.0)
 
     def init(self):
         self._generate_new_target()

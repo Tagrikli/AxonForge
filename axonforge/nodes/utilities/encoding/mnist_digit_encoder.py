@@ -13,9 +13,9 @@ import numpy as np
 
 from ....core.node import Node
 from ....core.descriptors.ports import InputPort, OutputPort
-from ....core.descriptors.properties import Range, Integer
-from ....core.descriptors.displays import Vector2D, Text
-from ....core.descriptors.store import Store
+from ....core.descriptors.fields import Range, Integer
+from ....core.descriptors.displays import Heatmap, Text
+from ....core.descriptors.state import State
 from ....core.descriptors import branch
 
 
@@ -40,11 +40,11 @@ class MNISTDigitEncoder(Node):
     falloff = Range("Falloff", default=1.0, min_val=0.1, max_val=10.0, scale="linear")
 
     # ── Displays ───────────────────────────────────────────────────────────
-    preview = Vector2D("Preview", color_mode="grayscale")
+    preview = Heatmap("Preview", colormap="grayscale")
     info = Text("Info", default="No input")
 
-    # ── Store ─────────────────────────────────────────────────────────────
-    last_label = Store(default=None)
+    # ── State ─────────────────────────────────────────────────────────────
+    last_label = State(default=None)
 
     # Output dimensions
     OUTPUT_HEIGHT = 28
@@ -180,11 +180,11 @@ class AngleEncoder(Node):
     falloff = Range("Falloff", default=1.0, min_val=0.1, max_val=10.0, scale="linear")
 
     # ── Displays ────────────────────────────────────────────────────────────
-    preview = Vector2D("Preview", color_mode="grayscale")
+    preview = Heatmap("Preview", colormap="grayscale")
     info = Text("Info", default="No input")
 
-    # ── Store ─────────────────────────────────────────────────────────────
-    last_angle = Store(default=None)
+    # ── State ─────────────────────────────────────────────────────────────
+    last_angle = State(default=None)
 
     # Output dimensions
     OUTPUT_HEIGHT = 28

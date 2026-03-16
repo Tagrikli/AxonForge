@@ -4,11 +4,11 @@ NodeItem — QGraphicsItem representing a single node on the canvas.
 Layout (top to bottom):
   Header  (title + reload btn)
   I/O ports row
-  Properties (sliders, etc.)
+  Fields (sliders, etc.)
   Actions (buttons)
   Displays (images, text, etc.)
 
-Property widgets are embedded via QGraphicsProxyWidget.
+Field widgets are embedded via QGraphicsProxyWidget.
 Display outputs are painted directly for performance.
 """
 
@@ -16,18 +16,20 @@ from __future__ import annotations
 
 import hashlib
 import math
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import numpy as np
 
 from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, Signal, QObject, QTimer, QEvent
 from PySide6.QtGui import (
-    QPen, QBrush, QColor, QPainter, QFont, QFontMetrics, QImage, QPainterPath,
+    QCursor, QPen, QBrush, QColor, QPainter, QFont, QFontMetrics, QImage, QPainterPath,
 )
 from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsProxyWidget,
-    QWidget, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox, QPushButton,
-    QHBoxLayout, QVBoxLayout, QLabel, QSizePolicy, QToolTip,
+    QWidget, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox, QPushButton, QLineEdit,
+    QPlainTextEdit,
+    QFileDialog, QHBoxLayout, QVBoxLayout, QLabel, QSizePolicy, QToolTip, QMenu,
     QStyleOptionGraphicsItem, QGraphicsSceneMouseEvent, QProxyStyle, QStyle,
 )
 
@@ -54,15 +56,17 @@ ERROR_COLOR = QColor("#ff3b30")  # Red for error state
 ERROR_PANEL_BG = QColor(80, 20, 20, 180)
 ERROR_PANEL_BORDER = QColor(140, 40, 40)
 ERROR_TEXT = QColor("#ff6b6b")
-STORES_TEXT = QColor("#57d37a")
+STATE_TEXT = QColor("#57d37a")
 LOADING_OVERLAY_BG = QColor(12, 18, 32, 165)
 LOADING_TEXT = QColor("#d6e6ff")
 
 HEADER_HEIGHT = 22.0
 PORT_ROW_HEIGHT = 18.0
 NODE_MIN_WIDTH = 250.0
+PLOT_NODE_MIN_WIDTH = 340.0
 PADDING = 6.0
 MAX_DISPLAY_DIM = 512
+PLOT_DISPLAY_HEIGHT = 130.0
 FONT_FAMILY = "Roboto"
 MONO_FAMILY = "Roboto Mono"
 
@@ -100,7 +104,8 @@ def _generate_category_color(category: str) -> QColor:
 class _NodeSignals(QObject):
     """Signals emitted by NodeItem (QGraphicsItem can't emit signals directly)."""
     position_changed = Signal(str, float, float)  # node_id, x, y
-    property_changed = Signal(str, str, object)   # node_id, prop_key, value
+    name_change_requested = Signal(str, str)      # node_id, new_name
+    field_changed = Signal(str, str, object)   # node_id, field_key, value
     action_triggered = Signal(str, str)            # node_id, action_key
     reload_requested = Signal(str)                 # node_id
 
@@ -129,6 +134,27 @@ class _AbsoluteClickSliderStyle(QProxyStyle):
         return super().styleHint(hint, option, widget, returnData)
 
 
+class _NodeProxyWidget(QGraphicsProxyWidget):
+    """Proxy widget that keeps child popups above node paint layers."""
+
+    def newProxyWidget(self, child):
+        proxy = super().newProxyWidget(child)
+        if proxy is not None:
+            proxy.setZValue(Z_NODE_WIDGET + 100)
+        return proxy
+
+
+class _NodeTextDisplay(QPlainTextEdit):
+    """Read-only text display that yields wheel events when it cannot scroll."""
+
+    def wheelEvent(self, event) -> None:
+        scrollbar = self.verticalScrollBar()
+        if scrollbar is None or scrollbar.maximum() <= scrollbar.minimum():
+            event.ignore()
+            return
+        super().wheelEvent(event)
+
+
 class NodeItem(QGraphicsItem):
     """Visual representation of a Node on the canvas."""
 
@@ -148,9 +174,15 @@ class NodeItem(QGraphicsItem):
         self.output_ports: List[PortItem] = []
         self._port_hit_zones: Dict[str, PortHitZoneItem] = {}
 
-        # Proxy widgets for properties
+        # Proxy widgets for fields/actions
         self._proxy_widgets: List[QGraphicsProxyWidget] = []
+        self._text_display_proxies: Dict[str, QGraphicsProxyWidget] = {}
+        self._text_display_widgets: Dict[str, QPlainTextEdit] = {}
+        self._popup_menus: List[QMenu] = []
         self._right_click_filters: List[QObject] = []
+        self._title_edit_proxy: Optional[QGraphicsProxyWidget] = None
+        self._title_edit: Optional[QLineEdit] = None
+        self._editing_title = False
 
         # Display cache: {output_key: value}
         self._display_cache: Dict[str, Any] = {}
@@ -162,13 +194,14 @@ class NodeItem(QGraphicsItem):
         self._display_rgb_cache: Dict[str, np.ndarray] = {}
 
         # Computed layout metrics
-        self._width = NODE_MIN_WIDTH
+        has_plot_output = any(output.get("type") == "plot" for output in schema.get("outputs", []))
+        self._width = max(NODE_MIN_WIDTH, PLOT_NODE_MIN_WIDTH if has_plot_output else NODE_MIN_WIDTH)
         self._height = 0.0
         self._body_y = 0.0
         self._display_rects: Dict[str, QRectF] = {}
         self._error_partition_rect: Optional[QRectF] = None
-        self._stores_hint_rect: Optional[QRectF] = None
-        self._stores_hint_text: str = ""
+        self._state_hint_rect: Optional[QRectF] = None
+        self._state_hint_text: str = ""
 
         # Fonts
         self._title_font = QFont(FONT_FAMILY, 8)
@@ -209,8 +242,10 @@ class NodeItem(QGraphicsItem):
         self.setPos(pos.get("x", 0), pos.get("y", 0))
 
         # Build
+        self._build_title_editor()
         self._build_ports()
-        self._build_property_widgets()
+        self._build_field_widgets()
+        self._build_display_widgets()
         self._apply_loading_ui_state()
         self._layout()
         if self._loading:
@@ -265,14 +300,29 @@ class NodeItem(QGraphicsItem):
             key = f"output:{port.port_name}"
             self._port_hit_zones[key] = PortHitZoneItem(port=port, parent=self)
 
-    # ── Property widgets ─────────────────────────────────────────────────
+    def _build_title_editor(self) -> None:
+        self._title_edit = QLineEdit(self._title)
+        self._title_edit.setFont(self._title_font)
+        self._title_edit.setStyleSheet(
+            "QLineEdit { background: #11172a; color: #e6f1ff; border: 1px solid #00f5ff;"
+            " border-radius: 3px; padding: 0 4px; font-size: 10px; }"
+        )
+        self._disable_widget_right_click(self._title_edit)
+        self._title_edit.returnPressed.connect(self._commit_title_rename)
+        self._title_edit.editingFinished.connect(self._commit_title_rename)
+        self._title_edit_proxy = _NodeProxyWidget(self)
+        self._title_edit_proxy.setWidget(self._title_edit)
+        self._title_edit_proxy.setZValue(Z_NODE_WIDGET + 1)
+        self._title_edit_proxy.setVisible(False)
 
-    def _build_property_widgets(self) -> None:
-        """Create embedded QWidgets for each property."""
-        for prop in self.schema.get("properties", []):
-            widget = self._create_property_widget(prop)
+    # ── Field widgets ─────────────────────────────────────────────────
+
+    def _build_field_widgets(self) -> None:
+        """Create embedded QWidgets for each field."""
+        for field in self.schema.get("fields", []):
+            widget = self._create_field_widget(field)
             if widget:
-                proxy = QGraphicsProxyWidget(self)
+                proxy = _NodeProxyWidget(self)
                 proxy.setWidget(widget)
                 proxy.setZValue(Z_NODE_WIDGET)
                 self._proxy_widgets.append(proxy)
@@ -297,25 +347,58 @@ class NodeItem(QGraphicsItem):
                 btn.clicked.connect(lambda checked=False, k=key: self.signals.action_triggered.emit(self.node_id, k))
                 layout.addWidget(btn)
             container.setFixedHeight(22)
-            proxy = QGraphicsProxyWidget(self)
+            proxy = _NodeProxyWidget(self)
             proxy.setWidget(container)
             proxy.setZValue(Z_NODE_WIDGET)
             self._proxy_widgets.append(proxy)
 
-    def _create_property_widget(self, prop: dict) -> Optional[QWidget]:
-        ptype = prop.get("type", "")
-        key = prop.get("key", "")
+    def _build_display_widgets(self) -> None:
+        """Create embedded widgets for displays that need native interaction."""
+        for output in self.schema.get("outputs", []):
+            if output.get("type") != "text":
+                continue
+            key = output.get("key", "")
+            editor = _NodeTextDisplay()
+            editor.setReadOnly(True)
+            editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+            editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            editor.setFont(self._value_font)
+            editor.setPlainText(str(output.get("value", output.get("default", "")) or ""))
+            editor.setStyleSheet(
+                "QPlainTextEdit { background: #11172a; color: #00f5ff; border: 1px solid #26324d; "
+                "padding: 4px; font-size: 8px; font-family: 'Roboto Mono'; selection-background-color: #2a3a5f; }"
+                "QScrollBar:vertical { background: #11172a; width: 8px; margin: 1px; }"
+                "QScrollBar::handle:vertical { background: #8fa4ff; min-height: 18px; border-radius: 3px; }"
+                "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+            )
+            proxy = _NodeProxyWidget(self)
+            proxy.setWidget(editor)
+            proxy.setZValue(Z_NODE_WIDGET)
+            self._text_display_proxies[key] = proxy
+            self._text_display_widgets[key] = editor
+
+    def _create_field_widget(self, field: dict) -> Optional[QWidget]:
+        ptype = field.get("type", "")
+        key = field.get("key", "")
 
         if ptype == "range":
-            return self._make_range_widget(prop, key)
+            return self._make_range_widget(field, key)
         elif ptype == "float":
-            return self._make_float_widget(prop, key)
+            return self._make_float_widget(field, key)
         elif ptype == "integer":
-            return self._make_integer_widget(prop, key)
+            return self._make_integer_widget(field, key)
         elif ptype == "bool":
-            return self._make_bool_widget(prop, key)
+            return self._make_bool_widget(field, key)
         elif ptype == "enum":
-            return self._make_enum_widget(prop, key)
+            return self._make_enum_widget(field, key)
+        elif ptype == "directory_path":
+            return self._make_directory_path_widget(field, key)
+        elif ptype == "file_path":
+            return self._make_file_path_widget(field, key)
+        elif ptype == "file_paths":
+            return self._make_file_paths_widget(field, key)
         return None
 
     def _make_range_widget(self, prop: dict, key: str) -> QWidget:
@@ -430,7 +513,7 @@ class NodeItem(QGraphicsItem):
                 real = pmin
 
             val_lbl.setText(f"{real:.4f}" if prop.get("scale") == "log" else f"{real:.3f}")
-            self.signals.property_changed.emit(self.node_id, key, real)
+            self.signals.field_changed.emit(self.node_id, key, real)
 
         slider.valueChanged.connect(on_slider_change)
         layout.addWidget(slider)
@@ -483,7 +566,7 @@ class NodeItem(QGraphicsItem):
 
         def on_spin_change(v: int) -> None:
             val_lbl.setText(str(v))
-            self.signals.property_changed.emit(self.node_id, key, v)
+            self.signals.field_changed.emit(self.node_id, key, v)
 
         spin.valueChanged.connect(on_spin_change)
         layout.addWidget(spin)
@@ -531,7 +614,7 @@ class NodeItem(QGraphicsItem):
 
         def on_spin_change(v: float) -> None:
             val_lbl.setText(f"{v:.3f}")
-            self.signals.property_changed.emit(self.node_id, key, v)
+            self.signals.field_changed.emit(self.node_id, key, v)
 
         spin.valueChanged.connect(on_spin_change)
         layout.addWidget(spin)
@@ -561,7 +644,7 @@ class NodeItem(QGraphicsItem):
         )
 
         def on_check(state: int) -> None:
-            self.signals.property_changed.emit(self.node_id, key, state == Qt.CheckState.Checked.value)
+            self.signals.field_changed.emit(self.node_id, key, state == Qt.CheckState.Checked.value)
 
         cb.stateChanged.connect(on_check)
         layout.addWidget(cb)
@@ -580,41 +663,251 @@ class NodeItem(QGraphicsItem):
         lbl.setStyleSheet("color: #8fa4ff; font-size: 8px; background: transparent;")
         layout.addWidget(lbl)
 
-        combo = QComboBox()
-        combo.setFixedHeight(20)
-        combo.setStyleSheet(
-            "QComboBox { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; "
-            "font-size: 8px; padding: 0 6px; }"
-            "QComboBox:hover { border-color: #00f5ff; }"
-            "QComboBox::drop-down { border: none; width: 16px; }"
-            "QComboBox::down-arrow { border-left: 3px solid transparent; border-right: 3px solid transparent; "
-            "border-top: 4px solid #8fa4ff; }"
-            "QComboBox QAbstractItemView { background: #11172a; border: 1px solid #26324d; "
-            "color: #e6f1ff; selection-background-color: #141c2f; selection-color: #00f5ff; }"
+        button = QPushButton()
+        button.setFixedHeight(20)
+        button.setStyleSheet(
+            "QPushButton { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; "
+            "font-size: 8px; padding: 0 6px; text-align: left; }"
+            "QPushButton:hover { border-color: #00f5ff; }"
         )
-        for opt in prop.get("options", []):
-            combo.addItem(opt)
+        self._disable_widget_right_click(button)
+
+        menu = QMenu()
+        menu.setWindowFlag(Qt.WindowType.Popup, True)
+        menu.setStyleSheet(
+            "QMenu { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; }"
+            "QMenu::item { padding: 4px 14px; }"
+            "QMenu::item:selected { background: #141c2f; color: #00f5ff; }"
+        )
+        self._popup_menus.append(menu)
+
         current = prop.get("value", prop.get("default", ""))
-        idx = combo.findText(current)
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
+        button.setText(str(current))
 
-        def on_combo(text: str) -> None:
-            self.signals.property_changed.emit(self.node_id, key, text)
+        def _apply_value(text: str) -> None:
+            button.setText(text)
+            self.signals.field_changed.emit(self.node_id, key, text)
 
-        combo.currentTextChanged.connect(on_combo)
-        layout.addWidget(combo)
+        for opt in prop.get("options", []):
+            action = menu.addAction(opt)
+            action.triggered.connect(lambda checked=False, text=opt: _apply_value(text))
+
+        def _show_menu() -> None:
+            menu.exec(QCursor.pos())
+
+        button.clicked.connect(_show_menu)
+        layout.addWidget(button)
 
         container.setFixedHeight(34)
         return container
+
+    def _make_directory_path_widget(self, prop: dict, key: str) -> QWidget:
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        lbl = QLabel(prop.get("label", key))
+        lbl.setStyleSheet("color: #8fa4ff; font-size: 8px; background: transparent;")
+        layout.addWidget(lbl)
+
+        row = QWidget()
+        row.setStyleSheet("background: transparent;")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+
+        line_edit = QLineEdit()
+        line_edit.setReadOnly(True)
+        line_edit.setText(str(prop.get("value", prop.get("default", "")) or ""))
+        line_edit.setPlaceholderText("No directory selected")
+        line_edit.setToolTip(line_edit.text())
+        line_edit.setStyleSheet(
+            "QLineEdit { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; "
+            "font-size: 8px; padding: 0 4px; }"
+        )
+        self._disable_widget_right_click(line_edit)
+
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(28)
+        browse_btn.setFixedHeight(20)
+        browse_btn.setStyleSheet(
+            "QPushButton { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; font-size: 8px; }"
+            "QPushButton:hover { border-color: #00f5ff; color: #00f5ff; }"
+        )
+        self._disable_widget_right_click(browse_btn)
+
+        def on_browse() -> None:
+            start_dir = line_edit.text().strip() or self._dialog_project_dir()
+            selected = QFileDialog.getExistingDirectory(
+                None,
+                prop.get("label", key),
+                start_dir,
+            )
+            if not selected:
+                return
+            line_edit.setText(selected)
+            line_edit.setToolTip(selected)
+            self.signals.field_changed.emit(self.node_id, key, selected)
+
+        browse_btn.clicked.connect(on_browse)
+        row_layout.addWidget(line_edit, 1)
+        row_layout.addWidget(browse_btn, 0)
+        layout.addWidget(row)
+
+        container.setFixedHeight(42)
+        return container
+
+    def _make_file_path_widget(self, prop: dict, key: str) -> QWidget:
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        lbl = QLabel(prop.get("label", key))
+        lbl.setStyleSheet("color: #8fa4ff; font-size: 8px; background: transparent;")
+        layout.addWidget(lbl)
+
+        row = QWidget()
+        row.setStyleSheet("background: transparent;")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+
+        line_edit = QLineEdit()
+        line_edit.setReadOnly(True)
+        line_edit.setText(str(prop.get("value", prop.get("default", "")) or ""))
+        line_edit.setPlaceholderText("No file selected")
+        line_edit.setToolTip(line_edit.text())
+        line_edit.setStyleSheet(
+            "QLineEdit { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; "
+            "font-size: 8px; padding: 0 4px; }"
+        )
+        self._disable_widget_right_click(line_edit)
+
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(28)
+        browse_btn.setFixedHeight(20)
+        browse_btn.setStyleSheet(
+            "QPushButton { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; font-size: 8px; }"
+            "QPushButton:hover { border-color: #00f5ff; color: #00f5ff; }"
+        )
+        self._disable_widget_right_click(browse_btn)
+
+        def on_browse() -> None:
+            start_dir = self._dialog_project_dir()
+            current_path = line_edit.text().strip()
+            if current_path:
+                start_dir = str(Path(current_path).expanduser().parent)
+            selected, _ = QFileDialog.getOpenFileName(
+                None,
+                prop.get("label", key),
+                start_dir,
+                "All Files (*)",
+            )
+            if not selected:
+                return
+            line_edit.setText(selected)
+            line_edit.setToolTip(selected)
+            self.signals.field_changed.emit(self.node_id, key, selected)
+
+        browse_btn.clicked.connect(on_browse)
+        row_layout.addWidget(line_edit, 1)
+        row_layout.addWidget(browse_btn, 0)
+        layout.addWidget(row)
+
+        container.setFixedHeight(42)
+        return container
+
+    def _make_file_paths_widget(self, prop: dict, key: str) -> QWidget:
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        lbl = QLabel(prop.get("label", key))
+        lbl.setStyleSheet("color: #8fa4ff; font-size: 8px; background: transparent;")
+        layout.addWidget(lbl)
+
+        row = QWidget()
+        row.setStyleSheet("background: transparent;")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+
+        values = prop.get("value", prop.get("default", [])) or []
+        line_edit = QLineEdit()
+        line_edit.setReadOnly(True)
+        line_edit.setText(self._format_file_paths_text(values))
+        line_edit.setPlaceholderText("No files selected")
+        line_edit.setToolTip("\n".join(str(item) for item in values))
+        line_edit.setStyleSheet(
+            "QLineEdit { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; "
+            "font-size: 8px; padding: 0 4px; }"
+        )
+        self._disable_widget_right_click(line_edit)
+
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(28)
+        browse_btn.setFixedHeight(20)
+        browse_btn.setStyleSheet(
+            "QPushButton { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; font-size: 8px; }"
+            "QPushButton:hover { border-color: #00f5ff; color: #00f5ff; }"
+        )
+        self._disable_widget_right_click(browse_btn)
+
+        def on_browse() -> None:
+            start_dir = self._dialog_project_dir()
+            tooltip_lines = [line for line in line_edit.toolTip().splitlines() if line.strip()]
+            if tooltip_lines:
+                start_dir = str(Path(tooltip_lines[0]).expanduser().parent)
+            selected, _ = QFileDialog.getOpenFileNames(
+                None,
+                prop.get("label", key),
+                start_dir,
+                "All Files (*)",
+            )
+            if not selected:
+                return
+            line_edit.setText(self._format_file_paths_text(selected))
+            line_edit.setToolTip("\n".join(selected))
+            self.signals.field_changed.emit(self.node_id, key, selected)
+
+        browse_btn.clicked.connect(on_browse)
+        row_layout.addWidget(line_edit, 1)
+        row_layout.addWidget(browse_btn, 0)
+        layout.addWidget(row)
+
+        container.setFixedHeight(42)
+        return container
+
+    def _dialog_project_dir(self) -> str:
+        scene = self.scene()
+        bridge = getattr(scene, "bridge", None)
+        project_dir = getattr(bridge, "project_dir", None)
+        return str(project_dir) if project_dir is not None else ""
+
+    def _format_file_paths_text(self, values: List[Any]) -> str:
+        if not values:
+            return ""
+        text_values = [str(item) for item in values]
+        if len(text_values) == 1:
+            return text_values[0]
+        return f"{len(text_values)} files"
 
     # ── Layout ───────────────────────────────────────────────────────────
 
     def _layout(self) -> None:
         """Compute positions for all sub-elements."""
+        # QGraphicsScene must be notified before this item's bounding rect changes.
+        self.prepareGeometryChange()
         y = 0.0
 
         # Header
+        self._layout_title_editor()
         y += HEADER_HEIGHT
 
         # I/O ports
@@ -666,7 +959,7 @@ class NodeItem(QGraphicsItem):
 
         self._body_y = y
 
-        # Property widgets
+        # Field widgets
         for proxy in self._proxy_widgets:
             w = proxy.widget()
             if w:
@@ -688,17 +981,20 @@ class NodeItem(QGraphicsItem):
                 self._display_rects[key] = QRectF(PADDING, y, self._width - 2 * PADDING, 0)
                 continue
 
-            if otype == "vector2d":
+            if otype in ("heatmap", "image"):
                 data = self._display_cache.get(key)
                 if data is not None:
                     if isinstance(data, list):
                         data = np.array(data)
-                    
-                    if hasattr(data, "shape") and len(data.shape) >= 2:
-                        rows, cols = data.shape[:2]
+
+                    if hasattr(data, "shape") and len(data.shape) >= 1:
+                        if len(data.shape) == 1:
+                            rows, cols = 1, data.shape[0]
+                        else:
+                            rows, cols = data.shape[:2]
                         if cols > 0:
                             aspect = rows / cols
-                            h = (self._width - 2 * PADDING) * aspect
+                            h = max(24.0, (self._width - 2 * PADDING) * aspect)
                         else:
                             h = self._width - 2 * PADDING
                     else:
@@ -707,16 +1003,8 @@ class NodeItem(QGraphicsItem):
                     h = self._width - 2 * PADDING  # default square
                 self._display_rects[key] = QRectF(PADDING, y, self._width - 2 * PADDING, h)
                 y += h + 2
-            elif otype == "vector1d":
-                h = 30
-                self._display_rects[key] = QRectF(PADDING, y, self._width - 2 * PADDING, h)
-                y += h + 2
-            elif otype == "barchart":
-                h = 30
-                self._display_rects[key] = QRectF(PADDING, y, self._width - 2 * PADDING, h)
-                y += h + 2
-            elif otype == "linechart":
-                h = 30
+            elif otype == "plot":
+                h = PLOT_DISPLAY_HEIGHT
                 self._display_rects[key] = QRectF(PADDING, y, self._width - 2 * PADDING, h)
                 y += h + 2
             elif otype == "numeric":
@@ -724,38 +1012,66 @@ class NodeItem(QGraphicsItem):
                 self._display_rects[key] = QRectF(PADDING, y, self._width - 2 * PADDING, h)
                 y += h + 2
             elif otype == "text":
-                # Calculate height based on text content
-                text_value = self._display_cache.get(key, "")
-                h = self._calculate_text_height(text_value, self._width - 2 * PADDING - 8)
+                text_value = self._display_cache.get(
+                    key,
+                    output.get("value", output.get("default", "")),
+                )
+                max_h = max(48.0, float(output.get("max_height", 140.0)))
+                content_h = self._calculate_text_height(text_value, self._width - 2 * PADDING - 8)
+                h = min(content_h, max_h)
                 self._display_rects[key] = QRectF(PADDING, y, self._width - 2 * PADDING, h)
+                proxy = self._text_display_proxies.get(key)
+                widget = self._text_display_widgets.get(key)
+                if proxy and widget:
+                    widget_width = int(self._width - 2 * PADDING)
+                    content_h = self._calculate_text_widget_height(widget, text_value, widget_width)
+                    h = min(content_h, max_h)
+                    self._display_rects[key] = QRectF(PADDING, y, self._width - 2 * PADDING, h)
+                    proxy.setPos(PADDING, y)
+                    widget.setFixedWidth(widget_width)
+                    widget.setFixedHeight(max(20, int(h)))
+                    needs_scroll = content_h > max_h + 0.5
+                    widget.setVerticalScrollBarPolicy(
+                        Qt.ScrollBarPolicy.ScrollBarAsNeeded
+                        if needs_scroll
+                        else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+                    )
+                    proxy.setVisible(bool(output.get("enabled", True)) and h > 0)
                 y += h + 2
 
-        # Stores information line at the bottom.
-        self._stores_hint_rect = None
-        self._stores_hint_text = ""
-        stores = self.schema.get("stores", [])
-        if stores:
+        # State information line at the bottom.
+        self._state_hint_rect = None
+        self._state_hint_text = ""
+        states = self.schema.get("states", [])
+        if states:
             labels: List[str] = []
-            for store in stores:
-                label = str(store.get("label") or store.get("key") or "").strip()
+            for entry in states:
+                label = str(entry.get("label") or entry.get("key") or "").strip()
                 if label:
                     labels.append(label)
             if labels:
-                self._stores_hint_text = "Stored: " + ", ".join(labels)
-                stores_width = max(0.0, self._width - 2 * PADDING)
+                self._state_hint_text = "State: " + ", ".join(labels)
+                state_width = max(0.0, self._width - 2 * PADDING)
                 fm = QFontMetrics(self._small_font)
                 wrapped = fm.boundingRect(
-                    0, 0, int(stores_width), 0,
+                    0, 0, int(state_width), 0,
                     int(Qt.TextFlag.TextWordWrap),
-                    self._stores_hint_text,
+                    self._state_hint_text,
                 )
-                stores_h = max(12.0, float(wrapped.height()))
-                self._stores_hint_rect = QRectF(PADDING, y, stores_width, stores_h)
-                y += stores_h + 2
+                state_h = max(12.0, float(wrapped.height()))
+                self._state_hint_rect = QRectF(PADDING, y, state_width, state_h)
+                y += state_h + 2
 
         y += PADDING
         self._height = y
-        self.prepareGeometryChange()
+
+    def _layout_title_editor(self) -> None:
+        if self._title_edit_proxy is None or self._title_edit is None:
+            return
+        rect = self._title_text_rect()
+        edit_h = max(18.0, HEADER_HEIGHT - 6.0)
+        self._title_edit.setFixedSize(max(40, int(rect.width())), int(edit_h))
+        self._title_edit_proxy.setPos(rect.x(), (HEADER_HEIGHT - edit_h) / 2.0)
 
     # ── Geometry ─────────────────────────────────────────────────────────
 
@@ -771,9 +1087,58 @@ class NodeItem(QGraphicsItem):
             widget = proxy.widget()
             if widget:
                 widget.setEnabled(enabled)
+        for widget in self._text_display_widgets.values():
+            widget.setEnabled(enabled)
 
     def _advance_loading_spinner(self) -> None:
         self._loading_spinner_angle = (self._loading_spinner_angle + 14.0) % 360.0
+        self.update()
+
+    def _title_text_rect(self) -> QRectF:
+        reload_reserve = 24.0 if self._dynamic else 8.0
+        return QRectF(
+            PADDING + 4.0,
+            0.0,
+            max(40.0, self._width - 2 * PADDING - reload_reserve),
+            HEADER_HEIGHT,
+        )
+
+    def _begin_title_rename(self) -> None:
+        if self._loading or self._title_edit is None or self._title_edit_proxy is None:
+            return
+        self._editing_title = True
+        self._title_edit.setText(self._title)
+        self._title_edit_proxy.setVisible(True)
+        self._title_edit.setFocus()
+        self._title_edit.selectAll()
+
+    def _finish_title_rename(self) -> str:
+        self._editing_title = False
+        if self._title_edit_proxy is not None:
+            self._title_edit_proxy.setVisible(False)
+        if self._title_edit is None:
+            return self._title
+        return self._title_edit.text().strip() or self.node_type
+
+    def _commit_title_rename(self) -> None:
+        if not self._editing_title:
+            return
+        new_name = self._finish_title_rename()
+        if new_name != self._title:
+            self.signals.name_change_requested.emit(self.node_id, new_name)
+
+    def cancel_title_rename(self) -> None:
+        if not self._editing_title:
+            return
+        self._finish_title_rename()
+        if self._title_edit is not None:
+            self._title_edit.setText(self._title)
+
+    def set_display_name(self, name: str) -> None:
+        self._title = str(name).strip() or self.node_type
+        self.schema["name"] = self._title
+        if self._title_edit is not None:
+            self._title_edit.setText(self._title)
         self.update()
 
     def set_loading_state(self, is_loading: bool) -> None:
@@ -782,6 +1147,8 @@ class NodeItem(QGraphicsItem):
             return
         self._loading = is_loading
         self._apply_loading_ui_state()
+        if self._title_edit is not None:
+            self._title_edit.setEnabled(not self._loading)
         if self._loading:
             self._loading_spinner_angle = 0.0
             self._loading_timer.start()
@@ -840,11 +1207,57 @@ class NodeItem(QGraphicsItem):
             painter.setBrush(QBrush(cat_color))
             painter.drawRect(QRectF(0, 0, 3, HEADER_HEIGHT))
 
-        # Title text
+        # Title text: user-defined name plus node type.
+        title_rect = self._title_text_rect()
+        type_text = f"({self.node_type})"
+        type_gap = 6.0
+        type_font = self._small_font
+        type_metrics = QFontMetrics(type_font)
+        type_width = min(
+            type_metrics.horizontalAdvance(type_text),
+            max(0, int(title_rect.width() * 0.45)),
+        )
+        name_rect = QRectF(title_rect)
+        if type_width > 0:
+            name_rect.setWidth(max(32.0, title_rect.width() - type_width - type_gap))
+
         painter.setPen(QPen(TEXT_PRIMARY))
         painter.setFont(self._title_font)
-        title_rect = QRectF(PADDING + 4, 0, self._width - 2 * PADDING - 20, HEADER_HEIGHT)
-        painter.drawText(title_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._title)
+        name_metrics = QFontMetrics(self._title_font)
+        name_text = name_metrics.elidedText(
+            self._title,
+            Qt.TextElideMode.ElideRight,
+            int(name_rect.width()),
+        )
+        painter.drawText(
+            name_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            name_text,
+        )
+
+        if type_width > 0:
+            name_draw_width = min(
+                name_metrics.horizontalAdvance(name_text),
+                int(name_rect.width()),
+            )
+            type_x = title_rect.x() + name_draw_width + type_gap
+            type_rect = QRectF(
+                type_x,
+                0.0,
+                max(0.0, title_rect.right() - type_x),
+                HEADER_HEIGHT,
+            )
+            painter.setPen(QPen(TEXT_SECONDARY))
+            painter.setFont(type_font)
+            painter.drawText(
+                type_rect,
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                type_metrics.elidedText(
+                    type_text,
+                    Qt.TextElideMode.ElideRight,
+                    int(type_rect.width()),
+                ),
+            )
 
         # Dynamic reload button indicator
         if self._dynamic:
@@ -942,27 +1355,23 @@ class NodeItem(QGraphicsItem):
                 continue
 
             # Draw the actual display
-            if otype == "vector2d":
-                self._paint_vector2d(painter, rect_d, key, output)
-            elif otype == "vector1d":
-                self._paint_vector1d(painter, rect_d, key)
-            elif otype == "barchart":
-                self._paint_barchart(painter, rect_d, key, output)
-            elif otype == "linechart":
-                self._paint_linechart(painter, rect_d, key, output)
+            if otype == "heatmap":
+                self._paint_heatmap(painter, rect_d, key, output)
+            elif otype == "image":
+                self._paint_image(painter, rect_d, key)
+            elif otype == "plot":
+                self._paint_plot(painter, rect_d, key, output)
             elif otype == "numeric":
                 self._paint_numeric(painter, rect_d, key, output)
-            elif otype == "text":
-                self._paint_text(painter, rect_d, key)
 
-        # Stores hint at node bottom.
-        if self._stores_hint_rect and self._stores_hint_text:
-            painter.setPen(QPen(STORES_TEXT))
+        # State hint at node bottom.
+        if self._state_hint_rect and self._state_hint_text:
+            painter.setPen(QPen(STATE_TEXT))
             painter.setFont(self._small_font)
             painter.drawText(
-                self._stores_hint_rect,
+                self._state_hint_rect,
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
-                self._stores_hint_text,
+                self._state_hint_text,
             )
 
         # Loading overlay on top of node contents.
@@ -1009,8 +1418,8 @@ class NodeItem(QGraphicsItem):
 
     # ── Display painting ─────────────────────────────────────────────────
 
-    def _paint_vector2d(self, painter: QPainter, rect: QRectF, key: str, spec: dict) -> None:
-        """Paint a 2D numpy array as a pixel image."""
+    def _paint_heatmap(self, painter: QPainter, rect: QRectF, key: str, spec: dict) -> None:
+        """Paint a 1D/2D scalar heatmap as a pixel image."""
         data = self._display_cache.get(key)
         if data is None or not isinstance(data, (np.ndarray, list)):
             painter.setPen(Qt.PenStyle.NoPen)
@@ -1019,57 +1428,70 @@ class NodeItem(QGraphicsItem):
             return
 
         if isinstance(data, list):
-            data = np.array(data, dtype=np.float32)
+            data = np.array(data)
 
-        if data.ndim != 2:
+        if not isinstance(data, np.ndarray):
             return
 
-        rows, cols = data.shape
-        # Use config from snapshot first, fall back to schema spec
-        config = self._display_config.get(key, {})
-        color_mode = config.get("color_mode", spec.get("color_mode", "grayscale"))
+        if data.ndim not in (1, 2):
+            return
 
-        # Limit maximum display size for performance
-        MAX_DIM = MAX_DISPLAY_DIM
-        if rows > MAX_DIM or cols > MAX_DIM:
-            step_rows = (rows + MAX_DIM - 1) // MAX_DIM
-            step_cols = (cols + MAX_DIM - 1) // MAX_DIM
+        config = self._display_config.get(key, {})
+        colormap = config.get("colormap", spec.get("colormap", "grayscale"))
+        scale_mode = config.get("scale_mode", spec.get("scale_mode", "auto"))
+        vmin = float(config.get("vmin", spec.get("vmin", 0.0)))
+        vmax = float(config.get("vmax", spec.get("vmax", 1.0)))
+
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        rows, cols = data.shape
+
+        if rows > MAX_DISPLAY_DIM or cols > MAX_DISPLAY_DIM:
+            step_rows = (rows + MAX_DISPLAY_DIM - 1) // MAX_DISPLAY_DIM
+            step_cols = (cols + MAX_DISPLAY_DIM - 1) // MAX_DISPLAY_DIM
             step = max(step_rows, step_cols)
             data = data[::step, ::step]
             rows, cols = data.shape
 
-        # Normalize data based on color mode
-        if color_mode == "viridis":
-            # viridis colormap - expects [-1, 1] range
-            t = np.clip((data + 1.0) / 2.0, 0.0, 1.0)
-            # Viridis approximation (perceptually uniform, purple to yellow)
+        finite_mask = np.isfinite(data)
+        if not np.any(finite_mask):
+            t = np.zeros_like(data, dtype=np.float32)
+        else:
+            finite_values = data[finite_mask]
+            if scale_mode == "manual":
+                low = vmin
+                high = vmax
+            else:
+                low = float(np.min(finite_values))
+                high = float(np.max(finite_values))
+            if not np.isfinite(low):
+                low = 0.0
+            if not np.isfinite(high) or high <= low:
+                high = low + 1.0
+            t = np.clip((data - low) / (high - low), 0.0, 1.0)
+            t = np.where(finite_mask, t, 0.0)
+
+        if colormap == "viridis":
             rc = np.clip(255 * (0.267 + 0.329 * t - 0.868 * t**2 + 1.65 * t**3), 0, 255).astype(np.uint8)
             gc = np.clip(255 * (0.012 + 0.696 * t - 1.16 * t**2 + 0.98 * t**3), 0, 255).astype(np.uint8)
             bc = np.clip(255 * (0.909 - 0.298 * t - 1.45 * t**2 + 2.22 * t**3), 0, 255).astype(np.uint8)
-        elif color_mode in ("bwr", "diverging"):
-            # map from [-1,1] to [0,1]
-            t = np.clip((data + 1.0) / 2.0, 0.0, 1.0)
-            # compute RGB using vectorized operations
+        elif colormap in ("bwr", "diverging"):
             mask = t < 0.5
             k = np.where(mask, t / 0.5, (t - 0.5) / 0.5)
             rc = np.where(mask, 255 * k, 255).astype(np.uint8)
             gc = np.where(mask, 255 * k, 255 * (1 - k)).astype(np.uint8)
             bc = np.where(mask, 255, 255 * (1 - k)).astype(np.uint8)
         else:
-            # grayscale
-            v = np.clip(data, 0.0, 1.0)
-            gray = (v * 255).astype(np.uint8)
+            gray = (t * 255).astype(np.uint8)
             rc = gray
             gc = gray
             bc = gray
 
-        # Combine channels into a (rows, cols, 3) uint8 array
         rgb = np.stack([rc, gc, bc], axis=2)
         rgb = np.ascontiguousarray(rgb)
-        # Keep reference to prevent garbage collection
         self._display_rgb_cache[key] = rgb
 
-        # Create QImage from memory buffer (RGB888, 3 bytes per pixel)
         img = QImage(rgb.data, cols, rows, cols * 3, QImage.Format.Format_RGB888)
         self._display_images[key] = img
         painter.save()
@@ -1077,8 +1499,65 @@ class NodeItem(QGraphicsItem):
         painter.drawImage(rect, img)
         painter.restore()
 
-    def _paint_vector1d(self, painter: QPainter, rect: QRectF, key: str) -> None:
-        """Paint a 1D array as a bar chart."""
+    def _paint_image(self, painter: QPainter, rect: QRectF, key: str) -> None:
+        """Paint a grayscale/RGB/RGBA image."""
+        data = self._display_cache.get(key)
+        if data is None or not isinstance(data, (np.ndarray, list)):
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(BG_SECONDARY))
+            painter.drawRect(rect)
+            return
+
+        image_data = np.asarray(data)
+        if image_data.ndim == 2:
+            image_data = image_data[:, :, None]
+        if image_data.ndim != 3 or image_data.shape[2] not in (1, 3, 4):
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(BG_SECONDARY))
+            painter.drawRect(rect)
+            return
+
+        rows, cols = image_data.shape[:2]
+        if rows > MAX_DISPLAY_DIM or cols > MAX_DISPLAY_DIM:
+            step_rows = (rows + MAX_DISPLAY_DIM - 1) // MAX_DISPLAY_DIM
+            step_cols = (cols + MAX_DISPLAY_DIM - 1) // MAX_DISPLAY_DIM
+            step = max(step_rows, step_cols)
+            image_data = image_data[::step, ::step]
+            rows, cols = image_data.shape[:2]
+
+        if np.issubdtype(image_data.dtype, np.floating):
+            finite = image_data[np.isfinite(image_data)]
+            max_value = float(np.max(finite)) if finite.size else 0.0
+            min_value = float(np.min(finite)) if finite.size else 0.0
+            if 0.0 <= min_value and max_value <= 1.0:
+                image_data = np.clip(image_data, 0.0, 1.0) * 255.0
+            else:
+                image_data = np.clip(image_data, 0.0, 255.0)
+        else:
+            image_data = np.clip(image_data, 0, 255)
+
+        image_data = np.where(np.isfinite(image_data), image_data, 0)
+        image_data = np.ascontiguousarray(image_data.astype(np.uint8))
+
+        if image_data.shape[2] == 1:
+            gray = np.repeat(image_data, 3, axis=2)
+            self._display_rgb_cache[key] = gray
+            img = QImage(gray.data, cols, rows, cols * 3, QImage.Format.Format_RGB888)
+        elif image_data.shape[2] == 4:
+            self._display_rgb_cache[key] = image_data
+            img = QImage(image_data.data, cols, rows, cols * 4, QImage.Format.Format_RGBA8888)
+        else:
+            self._display_rgb_cache[key] = image_data
+            img = QImage(image_data.data, cols, rows, cols * 3, QImage.Format.Format_RGB888)
+
+        self._display_images[key] = img
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        painter.drawImage(rect, img)
+        painter.restore()
+
+    def _paint_plot(self, painter: QPainter, rect: QRectF, key: str, spec: dict) -> None:
+        """Paint a 1D plot with grid, axis ticks, and value labels."""
         data = self._display_cache.get(key)
         if data is None:
             painter.setPen(Qt.PenStyle.NoPen)
@@ -1090,360 +1569,303 @@ class NodeItem(QGraphicsItem):
             data = np.array(data, dtype=np.float32)
         if isinstance(data, np.ndarray):
             data = data.flatten()
+        else:
+            data = np.asarray(data, dtype=np.float32).flatten()
 
+        if len(data) == 0:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(BG_SECONDARY))
+            painter.drawRect(rect)
+            return
+
+        config = self._display_config.get(key, {})
+        style = str(config.get("style", spec.get("style", "line")))
+
+        # Reserve margin for Y-axis tick labels on the left
+        tick_font = QFont(MONO_FAMILY, 5)
+        tick_fm = QFontMetrics(tick_font)
+        y_label_w = 30.0  # fixed width for y-axis labels
+        x_label_h = 10.0  # space for bottom tick labels
+
+        # Background
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(BG_SECONDARY))
         painter.drawRect(rect)
 
-        n = len(data)
-        if n == 0:
-            return
+        # Plot area (inset from rect to leave room for labels)
+        top_pad = 12.0  # room for value annotation at top
+        plot_rect = QRectF(
+            rect.x() + y_label_w,
+            rect.y() + top_pad,
+            rect.width() - y_label_w - 2,
+            rect.height() - top_pad - x_label_h,
+        )
 
-        dmin = float(np.nanmin(data))
-        dmax = float(np.nanmax(data))
+        if style == "bar":
+            self._paint_plot_bar(painter, rect, plot_rect, data, config, spec, tick_font)
+        else:
+            self._paint_plot_line(painter, rect, plot_rect, data, config, spec, tick_font)
+
+    @staticmethod
+    def _nice_ticks(dmin: float, dmax: float, max_ticks: int = 5) -> list[float]:
+        """Compute clean tick positions between dmin and dmax."""
+        if dmin == dmax:
+            return [dmin]
+        rng = dmax - dmin
+        rough_step = rng / max(max_ticks - 1, 1)
+        # Round to a 'nice' step: 1, 2, 5, 10, 20, 50, ...
+        mag = 10 ** math.floor(math.log10(rough_step)) if rough_step > 0 else 1.0
+        residual = rough_step / mag
+        if residual <= 1.5:
+            nice = 1.0
+        elif residual <= 3.5:
+            nice = 2.0
+        elif residual <= 7.5:
+            nice = 5.0
+        else:
+            nice = 10.0
+        step = nice * mag
+
+        start = math.floor(dmin / step) * step
+        ticks = []
+        v = start
+        while v <= dmax + step * 0.01:
+            if dmin <= v <= dmax:
+                ticks.append(v)
+            v += step
+        return ticks if ticks else [dmin, dmax]
+
+    @staticmethod
+    def _format_tick(v: float) -> str:
+        """Format a tick value concisely."""
+        av = abs(v)
+        if av == 0:
+            return "0"
+        if av >= 1000:
+            return f"{v:.0f}"
+        if av >= 1:
+            return f"{v:.1f}"
+        if av >= 0.01:
+            return f"{v:.2f}"
+        return f"{v:.1e}"
+
+    def _paint_plot_grid_and_ticks(
+        self, painter: QPainter, rect: QRectF, plot_rect: QRectF,
+        dmin: float, dmax: float, n: int, tick_font: QFont,
+    ) -> None:
+        """Draw grid lines and axis tick labels for a plot."""
+        grid_color = QColor("#26324d")
+        tick_color = QColor("#6b7fa0")
         rng = dmax - dmin if dmax != dmin else 1.0
 
-        # Limit number of bars for performance
-        max_bars = MAX_DISPLAY_DIM
-        if n > max_bars:
-            step = n // max_bars
-            data = data[::step]
-            n = len(data)
+        # Y-axis ticks and horizontal grid lines
+        y_ticks = self._nice_ticks(dmin, dmax, max_ticks=5)
+        painter.setFont(tick_font)
+        grid_pen = QPen(grid_color)
+        grid_pen.setWidthF(0.3)
+        grid_pen.setStyle(Qt.PenStyle.DotLine)
 
-        bar_w = rect.width() / n
-        painter.setBrush(QBrush(QColor("#e94560")))
-        for i in range(n):
-            v = (float(data[i]) - dmin) / rng
-            h = v * (rect.height() - 2)
-            painter.drawRect(QRectF(
-                rect.x() + i * bar_w,
-                rect.y() + rect.height() - h,
-                max(bar_w - 0.5, 0.5),
-                h,
-            ))
+        for tv in y_ticks:
+            ratio = (tv - dmin) / rng if rng != 0 else 0.5
+            y = plot_rect.y() + plot_rect.height() * (1.0 - ratio)
+            if plot_rect.y() <= y <= plot_rect.y() + plot_rect.height():
+                # Grid line
+                painter.setPen(grid_pen)
+                painter.drawLine(
+                    QPointF(plot_rect.x(), y),
+                    QPointF(plot_rect.x() + plot_rect.width(), y),
+                )
+                # Tick label
+                painter.setPen(QPen(tick_color))
+                label = self._format_tick(tv)
+                label_rect = QRectF(
+                    rect.x(), y - 5, plot_rect.x() - rect.x() - 2, 10,
+                )
+                painter.drawText(
+                    label_rect,
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                    label,
+                )
 
-    def _paint_barchart(self, painter: QPainter, rect: QRectF, key: str, spec: dict) -> None:
-        """Paint a 1D array as a bar chart with negative value support."""
-        data = self._display_cache.get(key)
-        if data is None:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(BG_SECONDARY))
-            painter.drawRect(rect)
+        # Zero line (solid, slightly brighter) if data spans zero
+        if dmin < 0 < dmax:
+            zero_ratio = (0 - dmin) / rng
+            zero_y = plot_rect.y() + plot_rect.height() * (1.0 - zero_ratio)
+            zero_pen = QPen(QColor("#444c66"))
+            zero_pen.setWidthF(0.6)
+            painter.setPen(zero_pen)
+            painter.drawLine(
+                QPointF(plot_rect.x(), zero_y),
+                QPointF(plot_rect.x() + plot_rect.width(), zero_y),
+            )
+
+        # Plot area border (left + bottom only)
+        border_pen = QPen(QColor("#26324d"))
+        border_pen.setWidthF(0.5)
+        painter.setPen(border_pen)
+        painter.drawLine(
+            QPointF(plot_rect.x(), plot_rect.y()),
+            QPointF(plot_rect.x(), plot_rect.y() + plot_rect.height()),
+        )
+        painter.drawLine(
+            QPointF(plot_rect.x(), plot_rect.y() + plot_rect.height()),
+            QPointF(plot_rect.x() + plot_rect.width(), plot_rect.y() + plot_rect.height()),
+        )
+
+    def _paint_plot_current_value(
+        self, painter: QPainter, plot_rect: QRectF,
+        data: np.ndarray, dmin: float, dmax: float, color: QColor,
+    ) -> None:
+        """Draw the current (last) value annotation at top-right."""
+        if len(data) == 0:
             return
+        last_val = float(data[-1])
+        label = self._format_tick(last_val)
 
-        if isinstance(data, list):
-            data = np.array(data, dtype=np.float32)
-        if isinstance(data, np.ndarray):
-            data = data.flatten()
+        font = QFont(MONO_FAMILY, 6)
+        font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(font)
+        painter.setPen(QPen(color))
 
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(BG_SECONDARY))
-        painter.drawRect(rect)
+        label_rect = QRectF(
+            plot_rect.x() + plot_rect.width() - 60,
+            plot_rect.y() + 1,
+            58, 10,
+        )
+        painter.drawText(
+            label_rect,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+            label,
+        )
 
+    def _paint_plot_bar(
+        self, painter: QPainter, rect: QRectF, plot_rect: QRectF,
+        data: np.ndarray, config: dict, spec: dict, tick_font: QFont,
+    ) -> None:
+        """Bar chart with grid and tick labels."""
         n = len(data)
         if n == 0:
             return
 
-        # Get configuration from display cache (set from bridge snapshot)
-        config = self._display_config.get(key, {})
-        scale_mode = config.get("scale_mode", "auto")
-        
-        # Determine dmin/dmax based on scale mode
+        scale_mode = config.get("scale_mode", spec.get("scale_mode", "auto"))
         if scale_mode == "manual":
-            dmin = config.get("scale_min", 0.0)
-            dmax = config.get("scale_max", 1.0)
+            dmin = float(config.get("vmin", spec.get("vmin", 0.0)))
+            dmax = float(config.get("vmax", spec.get("vmax", 1.0)))
         else:
-            # Auto mode: calculate from data
             dmin = float(np.nanmin(data))
             dmax = float(np.nanmax(data))
-        
-        has_negative = dmin < 0
-        has_positive = dmax > 0
-        
-        # Get configuration from spec
-        color = spec.get("color", "#e94560")
-        show_negative = spec.get("show_negative", True)
-        
-        # Calculate zero line position
-        if has_negative and has_positive:
-            # Both positive and negative values - zero line based on relative ranges
-            # The total range is dmax - dmin, zero is positioned proportionally
-            zero_ratio = -dmin / (dmax - dmin) if dmax != dmin else 0.5
-            zero_y = rect.y() + rect.height() * (1 - zero_ratio)
-            # Use the full range for scaling
-            rng = dmax - dmin
-        elif has_negative and not has_positive:
-            # All negative - zero at top
-            zero_y = rect.y()
-            rng = abs(dmin)
-        else:
-            # All positive - zero at bottom
-            zero_y = rect.y() + rect.height()
-            rng = dmax - dmin
+        if dmin == dmax:
+            dmax = dmin + 1.0
 
-        # Limit number of bars for performance
-        max_bars = MAX_DISPLAY_DIM
-        if n > max_bars:
-            step = n // max_bars
+        # Grid and ticks
+        self._paint_plot_grid_and_ticks(painter, rect, plot_rect, dmin, dmax, n, tick_font)
+
+        rng = dmax - dmin
+        positive_color = QColor(spec.get("color_positive", "#3dff6f"))
+        negative_color = QColor(spec.get("color_negative", "#e94560"))
+
+        # Downsample if needed
+        if n > MAX_DISPLAY_DIM:
+            step = max(1, n // MAX_DISPLAY_DIM)
             data = data[::step]
             n = len(data)
 
-        bar_w = rect.width() / n
-        
-        # Determine colors for positive and negative values
-        positive_color = QColor("#3dff6f")  # Green for positive
-        negative_color = QColor("#e94560")  # Red for negative
-        
-        for i in range(n):
-            v = float(data[i])
-            
-            # Determine bar height based on value relative to zero
-            if has_negative and has_positive:
-                # Mixed data: normalize from dmin to dmax
-                if rng != 0:
-                    normalized = (v - dmin) / rng
-                else:
-                    normalized = 0.0
-                normalized = max(0.0, min(1.0, normalized))
-                
-                if v >= 0:
-                    # Positive value - scale from zero upward
-                    h = max(0.0, (normalized - zero_ratio) * rect.height())
-                    painter.setBrush(QBrush(positive_color))
-                    top = zero_y - h
-                    clamped_top = max(rect.y(), top)
-                    clamped_height = zero_y - clamped_top
-                    if clamped_height > 0:
-                        painter.drawRect(QRectF(
-                            rect.x() + i * bar_w,
-                            clamped_top,
-                            max(bar_w - 0.5, 0.5),
-                            clamped_height,
-                        ))
-                else:
-                    # Negative value - scale from zero downward
-                    h = max(0.0, (zero_ratio - normalized) * rect.height())
-                    painter.setBrush(QBrush(negative_color))
-                    bottom = zero_y + h
-                    clamped_bottom = min(rect.y() + rect.height(), bottom)
-                    clamped_height = clamped_bottom - zero_y
-                    if clamped_height > 0:
-                        painter.drawRect(QRectF(
-                            rect.x() + i * bar_w,
-                            zero_y,
-                            max(bar_w - 0.5, 0.5),
-                            clamped_height,
-                        ))
-            elif has_positive and not has_negative:
-                # All positive: scale from zero (bottom) using dmax as reference
-                if dmax > 0:
-                    normalized = v / dmax
-                else:
-                    normalized = 0.0
-                normalized = max(0.0, min(1.0, normalized))
-                h = normalized * rect.height()
-                painter.setBrush(QBrush(positive_color))
-                top = zero_y - h
-                clamped_top = max(rect.y(), top)
-                clamped_height = zero_y - clamped_top
-                if clamped_height > 0:
-                    painter.drawRect(QRectF(
-                        rect.x() + i * bar_w,
-                        clamped_top,
-                        max(bar_w - 0.5, 0.5),
-                        clamped_height,
-                    ))
-            else:
-                # All negative: scale from zero (top) using abs(dmin) as reference
-                if dmin < 0:
-                    normalized = abs(v) / abs(dmin)
-                else:
-                    normalized = 0.0
-                normalized = max(0.0, min(1.0, normalized))
-                h = normalized * rect.height()
-                painter.setBrush(QBrush(negative_color))
-                bottom = zero_y + h
-                clamped_bottom = min(rect.y() + rect.height(), bottom)
-                clamped_height = clamped_bottom - zero_y
-                if clamped_height > 0:
-                    painter.drawRect(QRectF(
-                        rect.x() + i * bar_w,
-                        zero_y,
-                        max(bar_w - 0.5, 0.5),
-                        clamped_height,
-                    ))
-
-    def _paint_linechart(self, painter: QPainter, rect: QRectF, key: str, spec: dict) -> None:
-        """Paint a 1D array as a line chart."""
-        data = self._display_cache.get(key)
-        if data is None:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(BG_SECONDARY))
-            painter.drawRect(rect)
-            return
-
-        if isinstance(data, list):
-            data = np.array(data, dtype=np.float32)
-        if isinstance(data, np.ndarray):
-            data = data.flatten()
+        bar_w = plot_rect.width() / n
+        zero_ratio = max(0.0, min(1.0, (0.0 - dmin) / rng))
+        zero_y = plot_rect.y() + plot_rect.height() * (1.0 - zero_ratio)
 
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(BG_SECONDARY))
-        painter.drawRect(rect)
+        for i in range(n):
+            v = float(data[i])
+            v_ratio = max(0.0, min(1.0, (v - dmin) / rng))
+            v_y = plot_rect.y() + plot_rect.height() * (1.0 - v_ratio)
 
+            if v >= 0:
+                painter.setBrush(QBrush(positive_color))
+                top = min(v_y, zero_y)
+                h = abs(zero_y - v_y)
+            else:
+                painter.setBrush(QBrush(negative_color))
+                top = zero_y
+                h = abs(v_y - zero_y)
+
+            if h > 0:
+                painter.drawRect(QRectF(
+                    plot_rect.x() + i * bar_w, top,
+                    max(bar_w - 0.5, 0.5), h,
+                ))
+
+        # Current value label
+        color = positive_color if float(data[-1]) >= 0 else negative_color
+        self._paint_plot_current_value(painter, plot_rect, data, dmin, dmax, color)
+
+    def _paint_plot_line(
+        self, painter: QPainter, rect: QRectF, plot_rect: QRectF,
+        data: np.ndarray, config: dict, spec: dict, tick_font: QFont,
+    ) -> None:
+        """Line chart with grid and tick labels."""
         n = len(data)
         if n < 2:
             return
 
-        # Get configuration from display cache (set from bridge snapshot)
-        config = self._display_config.get(key, {})
-        scale_mode = config.get("scale_mode", "auto")
-        
-        # Determine dmin/dmax based on scale mode
+        scale_mode = config.get("scale_mode", spec.get("scale_mode", "auto"))
         if scale_mode == "manual":
-            dmin = config.get("scale_min", 0.0)
-            dmax = config.get("scale_max", 1.0)
+            dmin = float(config.get("vmin", spec.get("vmin", 0.0)))
+            dmax = float(config.get("vmax", spec.get("vmax", 1.0)))
         else:
-            # Auto mode: calculate from data
             dmin = float(np.nanmin(data))
             dmax = float(np.nanmax(data))
-        
-        rng = dmax - dmin if dmax != dmin else 1.0
+        if dmin == dmax:
+            dmax = dmin + 1.0
 
-        # Limit number of points for performance
-        max_points = MAX_DISPLAY_DIM
-        if n > max_points:
-            step = n // max_points
+        rng = dmax - dmin
+
+        # Grid and ticks
+        self._paint_plot_grid_and_ticks(painter, rect, plot_rect, dmin, dmax, n, tick_font)
+
+        # Downsample
+        if n > MAX_DISPLAY_DIM:
+            step = max(1, n // MAX_DISPLAY_DIM)
             data = data[::step]
             n = len(data)
 
-        # Get configuration from spec
-        line_color = spec.get("color", "#00f5ff")
-        line_width = spec.get("line_width", 1.5)
+        line_color = QColor(spec.get("color_positive", "#00f5ff"))
+        line_width = float(spec.get("line_width", 1.5))
 
-        # Draw lines with clipping and intersection calculation
-        pen = QPen(QColor(line_color))
+        step_x = plot_rect.width() / max(n - 1, 1)
+
+        # Build points
+        points: list[QPointF] = []
+        for i in range(n):
+            x = plot_rect.x() + i * step_x
+            ratio = (float(data[i]) - dmin) / rng if rng != 0 else 0.5
+            ratio = max(0.0, min(1.0, ratio))
+            y = plot_rect.y() + plot_rect.height() * (1.0 - ratio)
+            points.append(QPointF(x, y))
+
+        # Draw line segments
+        pen = QPen(line_color)
         pen.setWidthF(line_width)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
+        for i in range(len(points) - 1):
+            painter.drawLine(points[i], points[i + 1])
 
-        # Calculate points
-        step_x = rect.width() / (n - 1)
-        
-        # Helper function to clip point to chart bounds
-        def clip_to_bounds(x: float, y: float) -> tuple:
-            """Clip point to chart rectangle bounds."""
-            clipped_x = max(rect.x(), min(rect.x() + rect.width(), x))
-            clipped_y = max(rect.y(), min(rect.y() + rect.height(), y))
-            return (clipped_x, clipped_y)
-        
-        # Helper function to calculate intersection with chart boundaries
-        def get_intersection(x1: float, y1: float, x2: float, y2: float) -> list:
-            """Calculate intersection points of line segment with chart boundaries.
-            Returns list of intersection points (can be 0, 1, or 2 points).
-            """
-            intersections = []
-            
-            # Chart boundaries
-            left = rect.x()
-            right = rect.x() + rect.width()
-            top = rect.y()
-            bottom = rect.y() + rect.height()
-            
-            # Check if segment is completely outside
-            if (max(y1, y2) < top or min(y1, y2) > bottom):
-                return intersections  # No intersection
-            
-            # Check if segment is completely horizontal at boundary
-            if abs(y2 - y1) < 0.001:
-                if y1 >= top and y1 <= bottom:
-                    # Horizontal line within bounds - clip both points
-                    return [clip_to_bounds(x1, y1), clip_to_bounds(x2, y2)]
-                return intersections
-            
-            # Calculate slope
-            slope = (x2 - x1) / (y2 - y1)
-            
-            # Check intersection with top boundary (y = top)
-            if (y1 <= top and y2 >= top) or (y1 >= top and y2 <= top):
-                ix = x1 + slope * (top - y1)
-                if left <= ix <= right:
-                    intersections.append((ix, top))
-            
-            # Check intersection with bottom boundary (y = bottom)
-            if (y1 <= bottom and y2 >= bottom) or (y1 >= bottom and y2 <= bottom):
-                ix = x1 + slope * (bottom - y1)
-                if left <= ix <= right:
-                    intersections.append((ix, bottom))
-            
-            # Check intersection with left boundary (x = left)
-            if (x1 <= left and x2 >= left) or (x1 >= left and x2 <= left):
-                iy = y1 + (y2 - y1) * (left - x1) / (x2 - x1) if x2 != x1 else y1
-                if top <= iy <= bottom:
-                    intersections.append((left, iy))
-            
-            # Check intersection with right boundary (x = right)
-            if (x1 <= right and x2 >= right) or (x1 >= right and x2 <= right):
-                iy = y1 + (y2 - y1) * (right - x1) / (x2 - x1) if x2 != x1 else y1
-                if top <= iy <= bottom:
-                    intersections.append((right, iy))
-            
-            return intersections
-        
-        # Build list of valid points and draw segments
-        valid_points = []
-        
-        for i in range(n):
-            x = rect.x() + i * step_x
-            normalized_y = (float(data[i]) - dmin) / rng if rng != 0 else 0.5
-            normalized_y = max(0.0, min(1.0, normalized_y))  # Clamp
-            y = rect.y() + rect.height() * (1 - normalized_y)
-            
-            # Clip to bounds
-            x, y = clip_to_bounds(x, y)
-            valid_points.append(QPointF(x, y))
-        
-        # Draw line segments, calculating intersections for out-of-bounds segments
-        for i in range(n - 1):
-            x1_raw = rect.x() + i * step_x
-            normalized_y1_raw = (float(data[i]) - dmin) / rng if rng != 0 else 0.5
-            y1_raw = rect.y() + rect.height() * (1 - normalized_y1_raw)
-            
-            x2_raw = rect.x() + (i + 1) * step_x
-            normalized_y2_raw = (float(data[i + 1]) - dmin) / rng if rng != 0 else 0.5
-            y2_raw = rect.y() + rect.height() * (1 - normalized_y2_raw)
-            
-            # Check if segment is completely outside bounds
-            if (max(y1_raw, y2_raw) < rect.y() or min(y1_raw, y2_raw) > rect.y() + rect.height()):
-                continue  # Skip segments completely outside
-            
-            # Check if both points are within bounds - draw direct line
-            if (rect.y() <= y1_raw <= rect.y() + rect.height() and
-                rect.y() <= y2_raw <= rect.y() + rect.height() and
-                rect.x() <= x1_raw <= rect.x() + rect.width() and
-                rect.x() <= x2_raw <= rect.x() + rect.width()):
-                painter.drawLine(valid_points[i], valid_points[i + 1])
-            else:
-                # Segment crosses boundary - calculate intersections
-                intersections = get_intersection(x1_raw, y1_raw, x2_raw, y2_raw)
-                if len(intersections) >= 2:
-                    # Draw from first to last intersection
-                    painter.drawLine(QPointF(intersections[0][0], intersections[0][1]),
-                                    QPointF(intersections[-1][0], intersections[-1][1]))
-                elif len(intersections) == 1:
-                    # One intersection - clip and draw to intersection point
-                    painter.drawLine(valid_points[i], QPointF(intersections[0][0], intersections[0][1]))
+        # Subtle fill under the line
+        fill_color = QColor(line_color)
+        fill_color.setAlpha(18)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(fill_color))
+        fill_path = QPainterPath()
+        fill_path.moveTo(QPointF(points[0].x(), plot_rect.y() + plot_rect.height()))
+        for p in points:
+            fill_path.lineTo(p)
+        fill_path.lineTo(QPointF(points[-1].x(), plot_rect.y() + plot_rect.height()))
+        fill_path.closeSubpath()
+        painter.drawPath(fill_path)
 
-        # Draw zero line if there are negative values
-        if dmin < 0:
-            zero_ratio = -dmin / rng
-            zero_ratio = max(0.0, min(1.0, zero_ratio))
-            zero_y = rect.y() + rect.height() * (1 - zero_ratio)
-            pen_zero = QPen(QColor("#555555"))
-            pen_zero.setWidthF(0.5)
-            pen_zero.setStyle(Qt.PenStyle.DashLine)
-            painter.setPen(pen_zero)
-            painter.drawLine(QPointF(rect.x(), zero_y), QPointF(rect.x() + rect.width(), zero_y))
+        # Current value label
+        self._paint_plot_current_value(painter, plot_rect, data, dmin, dmax, line_color)
 
     def _paint_numeric(self, painter: QPainter, rect: QRectF, key: str, spec: dict) -> None:
         """Paint a numeric value."""
@@ -1462,19 +1884,6 @@ class NodeItem(QGraphicsItem):
         painter.setFont(self._value_font)
         painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
 
-    def _paint_text(self, painter: QPainter, rect: QRectF, key: str) -> None:
-        """Paint a text value."""
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(BG_SECONDARY))
-        painter.drawRect(rect)
-
-        value = self._display_cache.get(key)
-        text = str(value) if value is not None else ""
-
-        painter.setPen(QPen(ACCENT))
-        painter.setFont(self._value_font)
-        painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
-
     # ── Display updates ──────────────────────────────────────────────────
 
     def update_displays(self, outputs: Dict[str, Any]) -> None:
@@ -1487,13 +1896,10 @@ class NodeItem(QGraphicsItem):
                 if isinstance(value, dict) and 'value' in value:
                     display_value = value['value']
                     config = value.get('config', {})
-                    # Update config cache if changed (color_mode or scale settings)
+                    # Update config cache if changed.
                     if key in self._display_config:
                         old_config = self._display_config[key]
-                        if (old_config.get('color_mode') != config.get('color_mode') or
-                            old_config.get('scale_mode') != config.get('scale_mode') or
-                            old_config.get('scale_min') != config.get('scale_min') or
-                            old_config.get('scale_max') != config.get('scale_max')):
+                        if old_config != config:
                             self._display_config[key] = config
                             changed = True
                     else:
@@ -1512,7 +1918,7 @@ class NodeItem(QGraphicsItem):
                                 otype = output.get("type")
                                 if otype == "text":
                                     layout_needed = True
-                                elif otype == "vector2d":
+                                elif otype in ("heatmap", "image"):
                                     # Check if shape changed
                                     def get_shape(v):
                                         if hasattr(v, "shape"):
@@ -1532,6 +1938,11 @@ class NodeItem(QGraphicsItem):
                     layout_needed = True
 
                 self._display_cache[key] = display_value
+                text_widget = self._text_display_widgets.get(key)
+                if text_widget is not None:
+                    next_text = str(display_value) if display_value is not None else ""
+                    if text_widget.toPlainText() != next_text:
+                        text_widget.setPlainText(next_text)
                 changed = True
         if changed:
             # Re-layout if content changed to adjust node height
@@ -1557,13 +1968,35 @@ class NodeItem(QGraphicsItem):
 
     def _calculate_text_height(self, text: str, width: float) -> float:
         """Calculate the height needed for multiline text."""
-        if not text:
-            return 16.0
         fm = QFontMetrics(self._value_font)
+        min_height = max(24.0, float(fm.lineSpacing()) + 12.0)
+        if not text:
+            return min_height
         # Get bounding rect for the text with word wrap
-        rect = fm.boundingRect(0, 0, int(width), 0, 0, text)
-        # Return height with some padding, minimum 16
-        return max(16.0, rect.height() + 8)
+        rect = fm.boundingRect(
+            0,
+            0,
+            int(max(1.0, width)),
+            0,
+            int(Qt.TextFlag.TextWordWrap),
+            text,
+        )
+        return max(min_height, rect.height() + 12.0)
+
+    def _calculate_text_widget_height(
+        self,
+        widget: QPlainTextEdit,
+        text: str,
+        width: int,
+    ) -> float:
+        """Estimate the QPlainTextEdit height for wrapped text content."""
+        width = max(40, int(width))
+        frame = widget.frameWidth() * 2
+        margin = int(widget.document().documentMargin() * 2)
+        scrollbar_width = widget.verticalScrollBar().sizeHint().width()
+        viewport_width = max(20, width - frame - margin - scrollbar_width)
+        base_height = self._calculate_text_height(text, viewport_width)
+        return max(base_height, 24.0)
 
     def get_port(self, port_name: str, port_type: str) -> Optional[PortItem]:
         ports = self.input_ports if port_type == "input" else self.output_ports
@@ -1666,11 +2099,15 @@ class NodeItem(QGraphicsItem):
                 QToolTip.showText(global_pos, f"Types:\n{types_text}", view.viewport(), viewport_label_rect)
 
     def mouseDoubleClickEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        """Handle double-click on reload button area for dynamic nodes."""
+        """Handle double-click on reload button or title area."""
         if self._dynamic:
             if event.pos().x() > self._width - 24 and event.pos().y() < HEADER_HEIGHT:
                 self.signals.reload_requested.emit(self.node_id)
                 return
+        if self._title_text_rect().contains(event.pos()):
+            self._begin_title_rename()
+            event.accept()
+            return
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:

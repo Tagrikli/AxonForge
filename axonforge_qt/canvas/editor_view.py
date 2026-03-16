@@ -7,7 +7,7 @@ from datetime import datetime
 from PySide6.QtCore import Qt, QPointF, Signal, QRectF
 from typing import Optional
 from PySide6.QtGui import QPainter, QPen, QColor, QWheelEvent, QMouseEvent, QKeyEvent, QCursor, QImage
-from PySide6.QtWidgets import QGraphicsView, QGraphicsProxyWidget, QApplication
+from PySide6.QtWidgets import QGraphicsView, QGraphicsProxyWidget, QApplication, QPlainTextEdit
 
 from .editor_scene import EditorScene
 from .node_quick_add import NodeQuickAddPopup
@@ -116,6 +116,17 @@ class EditorView(QGraphicsView):
     # ── Mouse events ─────────────────────────────────────────────────────
 
     def wheelEvent(self, event: QWheelEvent) -> None:
+        item = self.itemAt(event.position().toPoint())
+        while item is not None:
+            if isinstance(item, QGraphicsProxyWidget):
+                widget = item.widget()
+                if isinstance(widget, QPlainTextEdit):
+                    scrollbar = widget.verticalScrollBar()
+                    if scrollbar is not None and scrollbar.maximum() > scrollbar.minimum():
+                        super().wheelEvent(event)
+                        return
+            item = item.parentItem()
+
         delta = event.angleDelta().y()
         factor = ZOOM_FACTOR ** delta
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
@@ -241,12 +252,10 @@ class EditorView(QGraphicsView):
         """Capture the entire scene and save it to the project's data/screenshots folder."""
         # 1. Determine save directory
         # Try to get the current project directory from the bridge
-        project_dir = getattr(self._scene.bridge, "current_project_dir", None)
+        project_dir = getattr(self._scene.bridge, "project_dir", None)
         if project_dir:
-            # Save under project_dir/data/screenshots
             save_dir = os.path.join(str(project_dir), "data", "screenshots")
         else:
-            # Fallback to root data/screenshots if no project is loaded
             save_dir = os.path.join(os.getcwd(), "data", "screenshots")
             
         os.makedirs(save_dir, exist_ok=True)
@@ -263,8 +272,10 @@ class EditorView(QGraphicsView):
         # Add padding
         rect.adjust(-50, -50, 50, 50)
 
-        # 4. Create the image
-        image = QImage(rect.size().toSize(), QImage.Format.Format_ARGB32)
+        # 4. Create the image at 3x resolution for crisp output
+        scale = 3
+        img_size = rect.size().toSize() * scale
+        image = QImage(img_size, QImage.Format.Format_ARGB32)
         image.fill(BG_PRIMARY)
 
         # 5. Render

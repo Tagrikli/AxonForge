@@ -51,7 +51,7 @@ class InputPort(BaseDescriptor, Generic[T]):
     """
     Input port descriptor - represents a connection point for incoming data.
     
-    Works like Property descriptors - values are stored on the instance and
+    Works like Field descriptors - values are stored on the instance and
     accessed directly via self.{attribute_name}.
     
     Args:
@@ -107,7 +107,7 @@ class OutputPort(BaseDescriptor, Generic[T]):
     """
     Output port descriptor - represents a connection point for outgoing data.
     
-    Works like Property descriptors - values are stored on the instance and
+    Works like Field descriptors - values are stored on the instance and
     accessed directly via self.{attribute_name}.
     
     Args:

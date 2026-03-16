@@ -8,6 +8,7 @@ The UI calls these directly; no serialization, no network overhead.
 import json
 import importlib
 import multiprocessing
+import copy
 import sys
 import threading
 import traceback
@@ -15,8 +16,6 @@ import uuid
 from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
-
-from PySide6.QtCore import QStandardPaths
 
 from axonforge.core.node import Node
 from axonforge.core.registry import (
@@ -40,10 +39,8 @@ from axonforge.network.network import Network, NetworkError
 
 
 APP_NAME = "AxonForge"
-WORKSPACES_DIR = Path("workspaces")
-PROJECT_FILENAME = "project.json"
-PROJECT_DATA_DIRNAME = "data"
-APP_CONFIG_FILENAME = "settings.json"
+GRAPH_DATA_DIRNAME = "data"
+GRAPH_DIR_NAME = "graphs"
 DEFAULT_EDITOR_STATE = {
     "drawer_collapsed": True,
     "drawer_width": 260,
@@ -54,7 +51,12 @@ DEFAULT_EDITOR_STATE = {
 }
 
 
-def _run_node_init_process(module_name: str, class_name: str, node_data: Dict[str, Any]) -> Dict[str, Any]:
+def _run_node_init_process(
+    module_name: str,
+    class_name: str,
+    node_data: Dict[str, Any],
+    project_dir: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Process worker for running Node.init() outside the UI process.
 
@@ -64,7 +66,10 @@ def _run_node_init_process(module_name: str, class_name: str, node_data: Dict[st
     try:
         module = importlib.import_module(module_name)
         node_class = getattr(module, class_name)
-        node = node_class.from_dict(node_data)
+        node = node_class.from_dict(
+            node_data,
+            project_dir=Path(project_dir) if project_dir else None,
+        )
         node.init()
         return {
             "ok": True,
@@ -84,7 +89,10 @@ def _run_node_init_process(module_name: str, class_name: str, node_data: Dict[st
 class BridgeAPI:
     """Synchronous API that the Qt UI calls directly."""
 
-    def __init__(self) -> None:
+    def __init__(self, project_dir: Path) -> None:
+        self.project_dir: Path = project_dir
+        self.current_graph_name: Optional[str] = None
+        self.current_graph_dirty: bool = False
         self.nodes: List[Node] = []
         self._nodes_lock = threading.Lock()
         self.network: Network = Network()
@@ -92,12 +100,6 @@ class BridgeAPI:
         self.node_palette: Dict[str, List[Type[Node]]] = {}
         self.viewport: Dict[str, Any] = {"pan": {"x": 0.0, "y": 0.0}, "zoom": 1.0}
         self.editor_state: Dict[str, Any] = dict(DEFAULT_EDITOR_STATE)
-        self.current_workspace: Optional[str] = None
-        self.current_project_dir: Optional[Path] = None
-        self._recent_projects: List[str] = []
-        self._config_dir = self._ensure_config_dir()
-        self._config_path = self._config_dir / APP_CONFIG_FILENAME
-        self._load_app_config()
         self._apply_editor_state_to_network()
 
         # Shared display buffer: {node_id: {output_key: value}}
@@ -117,55 +119,16 @@ class BridgeAPI:
     # ── Initialisation ───────────────────────────────────────────────────
 
     def init(self) -> None:
-        """Discover nodes and build palette."""
+        """Discover built-in and project-local nodes, build palette."""
         discover_nodes()
+        local_nodes = self.project_dir / "nodes"
+        if local_nodes.exists():
+            discover_nodes(nodes_dir=local_nodes, package=None)
         palette = build_node_palette()
         for category, class_list in palette.items():
             for cls in class_list:
                 self.node_classes[cls.__name__] = cls
         self.node_palette = palette
-
-    def _ensure_config_dir(self) -> Path:
-        """Resolve and create the per-user app config directory."""
-        base = QStandardPaths.writableLocation(
-            QStandardPaths.StandardLocation.GenericConfigLocation
-        )
-        if not base:
-            base = str(Path.home() / ".config")
-        config_dir = Path(base) / APP_NAME
-        config_dir.mkdir(parents=True, exist_ok=True)
-        return config_dir
-
-    def _load_app_config(self) -> None:
-        """Load persisted UI/app settings."""
-        if not self._config_path.exists():
-            return
-        try:
-            with open(self._config_path, encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"Warning: failed to load app config: {e}")
-            return
-
-        recent = data.get("recent_projects", [])
-        if isinstance(recent, list):
-            self._recent_projects = [str(p) for p in recent if str(p).strip()]
-
-    def _save_app_config(self) -> None:
-        """Persist UI/app settings (recent projects, etc.)."""
-        payload = {
-            "version": 1,
-            "recent_projects": self._recent_projects[:20],
-        }
-        try:
-            self._config_dir.mkdir(parents=True, exist_ok=True)
-            with open(self._config_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-        except Exception as e:
-            print(f"Warning: failed to save app config: {e}")
-
-    def get_config_dir(self) -> str:
-        return str(self._config_dir)
 
     # ── Display buffer (shared with computation thread) ──────────────────
 
@@ -184,23 +147,36 @@ class BridgeAPI:
                     val = getattr(node, name)
                 except Exception:
                     val = None
-                # Include display configuration from descriptor
-                output_config = {}
-                if hasattr(descriptor, 'color_mode'):
-                    output_config['color_mode'] = descriptor.color_mode
-                # Include scale configuration for bar/line charts
-                if hasattr(descriptor, 'scale_mode'):
-                    output_config['scale_mode'] = descriptor.scale_mode
-                    output_config['scale_min'] = descriptor.scale_min
-                    output_config['scale_max'] = descriptor.scale_max
+                output_config = descriptor.get_config(node)
                 outputs[name] = {
-                    'value': val,
-                    'config': output_config
+                    'value': self._clone_display_value(val),
+                    'config': dict(output_config),
                 }
             buf[node.node_id] = outputs
         with self._buffer_lock:
             self._display_buffer = buf
             self._dirty = True
+
+    def _clone_display_value(self, value: Any) -> Any:
+        """Clone display payloads so the UI sees stable snapshots, not live buffers."""
+        try:
+            import numpy as np
+            if isinstance(value, np.ndarray):
+                return value.copy()
+        except Exception:
+            pass
+
+        if isinstance(value, list):
+            return [self._clone_display_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._clone_display_value(item) for item in value)
+        if isinstance(value, dict):
+            return {k: self._clone_display_value(v) for k, v in value.items()}
+
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
 
     def read_display_buffer(self) -> Optional[Dict[str, Dict[str, Any]]]:
         """Read the display buffer if dirty. Returns None if clean."""
@@ -228,14 +204,14 @@ class BridgeAPI:
         if not node_id:
             return
         node._loading = True
-        node._loading_error = ""
         self._set_node_loading_state(node_id, True, "")
-        payload = node.to_dict()
+        payload = node.to_dict(project_dir=self.project_dir)
         future = self._init_executor.submit(
             _run_node_init_process,
             node.__class__.__module__,
             node.__class__.__name__,
             payload,
+            str(self.project_dir),
         )
         with self._init_jobs_lock:
             self._pending_init_jobs[node_id] = future
@@ -264,6 +240,7 @@ class BridgeAPI:
             if node is None:
                 continue
 
+            existing_error = str(getattr(node, "_loading_error", "") or "")
             error = ""
             worker_traceback = ""
             try:
@@ -295,9 +272,10 @@ class BridgeAPI:
                 if worker_traceback:
                     print(worker_traceback)
 
+            final_error = "\n".join(part for part in (existing_error, error) if part)
             node._loading = False
-            node._loading_error = error
-            self._set_node_loading_state(node_id, False, error)
+            node._loading_error = final_error
+            self._set_node_loading_state(node_id, False, final_error)
             has_display_update = True
 
         if has_display_update:
@@ -307,7 +285,7 @@ class BridgeAPI:
         """Stop worker processes used by background init."""
         with self._init_jobs_lock:
             self._pending_init_jobs.clear()
-        self._init_executor.shutdown(wait=False, cancel_futures=True)
+        self._init_executor.shutdown(wait=True, cancel_futures=True)
 
     # ── Node CRUD ────────────────────────────────────────────────────────
 
@@ -350,6 +328,7 @@ class BridgeAPI:
                 print(f"Node creation error: {e}")
                 if e.traceback:
                     print(e.traceback)
+        self.mark_current_graph_dirty()
         self.snapshot_displays()
         return node
 
@@ -367,6 +346,7 @@ class BridgeAPI:
         unregister_node(node_id)
         with self._loading_lock:
             self._node_loading_states.pop(node_id, None)
+        self.mark_current_graph_dirty()
         self.snapshot_displays()
 
     def get_node_schema(self, node_id: str) -> dict:
@@ -379,23 +359,34 @@ class BridgeAPI:
         node = get_node(node_id)
         if node:
             node.position = {"x": float(x), "y": float(y)}
+            self.mark_current_graph_dirty()
 
-    # ── Properties & Actions ─────────────────────────────────────────────
-
-    def set_property(self, node_id: str, prop_key: str, value: Any) -> None:
+    def set_node_name(self, node_id: str, name: str) -> str:
         node = get_node(node_id)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
-        setattr(node, prop_key, value)
+        clean_name = str(name).strip() or node.node_type
+        node.name = clean_name
+        self.mark_current_graph_dirty()
+        return clean_name
+
+    # ── Fields & Actions ─────────────────────────────────────────────────
+
+    def set_field(self, node_id: str, field_key: str, value: Any) -> None:
+        node = get_node(node_id)
+        if not node:
+            raise ValueError(f"Node not found: {node_id}")
+        setattr(node, field_key, value)
         # Only propagate when network is not running (let running network handle processing)
         if self.network and not self.network.running:
             try:
                 self.network.propagate_from_node(node_id, recompute_start=True)
             except NetworkError as e:
                 # Error is stored in network.last_error and node is tracked in failed_nodes
-                print(f"Property set error in '{node_id}.{prop_key}': {e}")
+                print(f"Field set error in '{node_id}.{field_key}': {e}")
                 if e.traceback:
                     print(e.traceback)
+        self.mark_current_graph_dirty()
         self.snapshot_displays()
 
     def execute_action(self, node_id: str, action_key: str, params: Optional[dict] = None) -> Any:
@@ -412,6 +403,7 @@ class BridgeAPI:
                 print(f"Action execution error in '{node_id}.{action_key}': {e}")
                 if e.traceback:
                     print(e.traceback)
+        self.mark_current_graph_dirty()
         self.snapshot_displays()
         return result
 
@@ -422,6 +414,7 @@ class BridgeAPI:
         if not hasattr(node, "_output_enabled") or node._output_enabled is None:
             node._output_enabled = {}
         node._output_enabled[output_key] = bool(enabled)
+        self.mark_current_graph_dirty()
 
     # ── Connections ──────────────────────────────────────────────────────
 
@@ -472,6 +465,7 @@ class BridgeAPI:
                 print(f"Connection creation error from '{from_node}.{from_output}' to '{to_node}.{to_input}': {e}")
                 if e.traceback:
                     print(e.traceback)
+        self.mark_current_graph_dirty()
         self.snapshot_displays()
 
     def delete_connection(
@@ -486,6 +480,7 @@ class BridgeAPI:
             key = (from_node, from_output)
             if hasattr(self.network, "_signals_now"):
                 self.network._signals_now.pop(key, None)
+        self.mark_current_graph_dirty()
         self.snapshot_displays()
 
     # ── Network Control ──────────────────────────────────────────────────
@@ -528,33 +523,39 @@ class BridgeAPI:
             "actual_hz": float(getattr(self.network, "actual_hz", 0.0)),
         }
 
-    # ── Projects ─────────────────────────────────────────────────────────
+    # ── Graphs ────────────────────────────────────────────────────────────
 
     @property
-    def current_project_name(self) -> str:
-        if self.current_project_dir:
-            return self.current_project_dir.name
-        return "unsaved"
+    def project_name(self) -> str:
+        """Read the project name from axonforge.json."""
+        meta_file = self.project_dir / "axonforge.json"
+        if meta_file.exists():
+            try:
+                data = json.loads(meta_file.read_text(encoding="utf-8"))
+                return data.get("name", self.project_dir.name)
+            except Exception:
+                pass
+        return self.project_dir.name
 
-    def _track_recent_project(self, project_dir: Path) -> None:
-        resolved = str(project_dir.resolve())
-        self._recent_projects = [p for p in self._recent_projects if p != resolved]
-        self._recent_projects.insert(0, resolved)
-        self._recent_projects = self._recent_projects[:20]
-        self._save_app_config()
+    @property
+    def current_graph_display_name(self) -> str:
+        return self.current_graph_name or "unsaved"
 
-    def list_recent_projects(self) -> List[str]:
-        kept: List[str] = []
-        for path in self._recent_projects:
-            p = Path(path)
-            if (p / PROJECT_FILENAME).exists():
-                kept.append(str(p))
-        if kept != self._recent_projects:
-            self._recent_projects = kept
-            self._save_app_config()
-        else:
-            self._recent_projects = kept
-        return list(self._recent_projects)
+    def mark_current_graph_dirty(self) -> None:
+        self.current_graph_dirty = True
+
+    def mark_current_graph_saved(self) -> None:
+        self.current_graph_dirty = False
+
+    def current_graph_has_content(self) -> bool:
+        if self.nodes:
+            return True
+        return bool(get_connections())
+
+    def current_graph_has_unsaved_state(self) -> bool:
+        return self.current_graph_dirty or (
+            self.current_graph_name is None and self.current_graph_has_content()
+        )
 
     def _clear_graph_state(self) -> None:
         self.stop_network()
@@ -577,34 +578,28 @@ class BridgeAPI:
             with self._loading_lock:
                 self._node_loading_states = {}
 
-    def new_project(self, project_dir: str | Path) -> None:
-        project_path = Path(project_dir).expanduser().resolve()
-        project_path.mkdir(parents=True, exist_ok=True)
-        self._clear_graph_state()
-        self.current_project_dir = project_path
-        self.current_workspace = project_path.name
-        self._track_recent_project(project_path)
-        self.snapshot_displays()
+    def list_graphs(self) -> List[str]:
+        """Return sorted list of graph names (without .json extension)."""
+        graphs_dir = self.project_dir / GRAPH_DIR_NAME
+        if not graphs_dir.exists():
+            return []
+        return sorted(
+            p.stem for p in graphs_dir.glob("*.json")
+        )
 
-    def save_project(self, project_dir: Optional[str | Path] = None) -> None:
-        target_dir: Optional[Path]
-        if project_dir is not None:
-            target_dir = Path(project_dir).expanduser().resolve()
-        else:
-            target_dir = self.current_project_dir
-        if target_dir is None:
-            raise ValueError("Project directory is not set")
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-        data_dir = target_dir / PROJECT_DATA_DIRNAME
+    def save_graph(self, name: str) -> None:
+        """Save current graph state to graphs/<name>.json."""
+        graphs_dir = self.project_dir / GRAPH_DIR_NAME
+        graphs_dir.mkdir(parents=True, exist_ok=True)
+        data_dir = self.project_dir / GRAPH_DATA_DIRNAME
         data_dir.mkdir(parents=True, exist_ok=True)
 
         def _array_serializer(array: Any) -> Dict[str, Any]:
             if not hasattr(array, "shape"):
                 return {"_type": "unsupported_array"}
             array_name = f"{uuid.uuid4().hex}.npy"
-            array_rel_path = Path(PROJECT_DATA_DIRNAME) / array_name
-            array_abs_path = target_dir / array_rel_path
+            array_rel_path = Path(GRAPH_DATA_DIRNAME) / array_name
+            array_abs_path = self.project_dir / array_rel_path
             import numpy as np
             np.save(array_abs_path, array)
             return {
@@ -615,31 +610,33 @@ class BridgeAPI:
         with self._nodes_lock:
             nodes_copy = list(self.nodes)
         payload = {
-            "version": 4,
-            "kind": "project",
-            "project_name": target_dir.name,
+            "version": 5,
+            "kind": "graph",
+            "name": name,
             "viewport": self.viewport,
             "editor": self.get_editor_state(),
-            "nodes": [n.to_dict(array_serializer=_array_serializer) for n in nodes_copy],
+            "nodes": [
+                n.to_dict(array_serializer=_array_serializer, project_dir=self.project_dir)
+                for n in nodes_copy
+            ],
             "connections": get_connections(),
         }
-        project_file = target_dir / PROJECT_FILENAME
-        with open(project_file, "w", encoding="utf-8") as f:
+        graph_file = graphs_dir / f"{name}.json"
+        with open(graph_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
 
-        self.current_project_dir = target_dir
-        self.current_workspace = target_dir.name
-        self._track_recent_project(target_dir)
+        self.current_graph_name = name
+        self.mark_current_graph_saved()
 
-    def load_project(self, project_dir: str | Path) -> dict:
+    def load_graph(self, name: str) -> dict:
+        """Load a graph from graphs/<name>.json. Returns viewport state."""
         self._loading_project = True
         try:
-            project_path = Path(project_dir).expanduser().resolve()
-            project_file = project_path / PROJECT_FILENAME
-            if not project_file.exists():
-                raise FileNotFoundError(f"Project not found: {project_file}")
+            graph_file = self.project_dir / GRAPH_DIR_NAME / f"{name}.json"
+            if not graph_file.exists():
+                raise FileNotFoundError(f"Graph not found: {graph_file}")
 
-            with open(project_file, encoding="utf-8") as f:
+            with open(graph_file, encoding="utf-8") as f:
                 data = json.load(f)
 
             self._clear_graph_state()
@@ -648,9 +645,9 @@ class BridgeAPI:
                 ref_file = str(ref.get("file", "")).strip()
                 if not ref_file:
                     raise ValueError("Invalid ndarray_ref with empty file")
-                array_path = (project_path / ref_file).resolve()
+                array_path = (self.project_dir / ref_file).resolve()
                 try:
-                    array_path.relative_to(project_path)
+                    array_path.relative_to(self.project_dir)
                 except ValueError:
                     raise ValueError(f"Invalid ndarray_ref path outside project: {ref_file}")
                 if not array_path.exists():
@@ -663,7 +660,11 @@ class BridgeAPI:
                 cls = self.node_classes.get(nd.get("type"))
                 if not cls:
                     continue
-                node = cls.from_dict(nd, array_loader=_array_loader)
+                node = cls.from_dict(
+                    nd,
+                    array_loader=_array_loader,
+                    project_dir=self.project_dir,
+                )
                 new_id = register_node(node)
                 node_id_map[nd.get("id")] = new_id
                 with self._nodes_lock:
@@ -671,18 +672,22 @@ class BridgeAPI:
                 if getattr(node.__class__, "_uses_background_init", False):
                     self._start_background_init(node)
                 else:
+                    restore_error = str(getattr(node, "_loading_error", "") or "")
                     try:
                         node.init()
                     except Exception as e:
                         error = str(e)
                         tb = traceback.format_exc()
-                        node._loading_error = error
-                        self._set_node_loading_state(new_id, False, error)
+                        final_error = "\n".join(
+                            part for part in (restore_error, error) if part
+                        )
+                        node._loading_error = final_error
+                        self._set_node_loading_state(new_id, False, final_error)
                         print(f"Node init failed for {node.node_type}: {e}")
                         print(tb)
                     else:
-                        node._loading_error = ""
-                        self._set_node_loading_state(new_id, False, "")
+                        node._loading_error = restore_error
+                        self._set_node_loading_state(new_id, False, restore_error)
 
             for conn in data.get("connections", []):
                 fn = node_id_map.get(conn["from_node"])
@@ -692,46 +697,45 @@ class BridgeAPI:
 
             self.viewport = data.get("viewport", {"pan": {"x": 0, "y": 0}, "zoom": 1.0})
             self.set_editor_state(data.get("editor", {}))
-            self.current_project_dir = project_path
-            self.current_workspace = project_path.name
-            self._track_recent_project(project_path)
+            self.current_graph_name = name
+            self.mark_current_graph_saved()
             self.snapshot_displays()
             return self.viewport
         finally:
             self._loading_project = False
 
-    # Legacy compatibility wrappers (workspace -> project)
-    def list_workspaces(self) -> List[dict]:
-        result = []
-        for project_path in self.list_recent_projects():
-            path = Path(project_path) / PROJECT_FILENAME
-            stat = path.stat()
-            result.append({
-                "name": Path(project_path).name,
-                "created": stat.st_ctime,
-                "modified": stat.st_mtime,
-            })
-        return result
-
-    def save_workspace(self, name: str) -> None:
-        WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
-        target = WORKSPACES_DIR / name
-        self.save_project(target)
-
-    def load_workspace(self, name: str) -> dict:
-        target = WORKSPACES_DIR / name
-        return self.load_project(target)
-
-    def delete_workspace(self, name: str) -> None:
-        target = (WORKSPACES_DIR / name / PROJECT_FILENAME)
-        if not target.exists():
-            raise FileNotFoundError(f"Workspace not found: {name}")
-        target.unlink()
-
-    def clear_workspace(self) -> None:
+    def new_graph(self, name: str | None = None) -> None:
+        """Clear state and start a new empty graph."""
         self._clear_graph_state()
-        self.current_project_dir = None
-        self.current_workspace = None
+        self.current_graph_name = name
+        self.current_graph_dirty = name is None
+        self.snapshot_displays()
+
+    def rename_graph(self, old_name: str, new_name: str) -> None:
+        """Rename a graph file on disk."""
+        graphs_dir = self.project_dir / GRAPH_DIR_NAME
+        old_file = graphs_dir / f"{old_name}.json"
+        new_file = graphs_dir / f"{new_name}.json"
+        if old_file.exists():
+            old_file.rename(new_file)
+        if self.current_graph_name == old_name:
+            self.current_graph_name = new_name
+
+    def delete_graph(self, name: str) -> None:
+        """Delete a graph file from disk."""
+        graph_file = self.project_dir / GRAPH_DIR_NAME / f"{name}.json"
+        if graph_file.exists():
+            graph_file.unlink()
+        if self.current_graph_name == name:
+            self._clear_graph_state()
+            self.current_graph_name = None
+            self.mark_current_graph_saved()
+            self.snapshot_displays()
+
+    def clear_graph(self) -> None:
+        """Clear the current graph state without changing the graph name."""
+        self._clear_graph_state()
+        self.mark_current_graph_dirty()
         self.snapshot_displays()
 
     # ── Hot Reload ───────────────────────────────────────────────────────
@@ -776,11 +780,11 @@ class BridgeAPI:
         new_node._loading = False
         new_node._loading_error = ""
 
-        # Only copy property values, not store values
-        for prop_name in getattr(old.__class__, "_properties", {}).keys():
-            if hasattr(old, prop_name):
+        # Only copy field values, not state values
+        for field_name in getattr(old.__class__, "_fields", {}).keys():
+            if hasattr(old, field_name):
                 try:
-                    setattr(new_node, prop_name, getattr(old, prop_name))
+                    setattr(new_node, field_name, getattr(old, field_name))
                 except Exception:
                     pass
 
@@ -804,6 +808,10 @@ class BridgeAPI:
 
     def rediscover(self) -> None:
         new_palette = rediscover_nodes()
+        local_nodes = self.project_dir / "nodes"
+        if local_nodes.exists():
+            discover_nodes(nodes_dir=local_nodes, package=None)
+            new_palette = build_node_palette()
         for category, classes in new_palette.items():
             for cls in classes:
                 self.node_classes[cls.__name__] = cls

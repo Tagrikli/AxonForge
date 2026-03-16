@@ -19,7 +19,9 @@ Usage:
 
 from typing import Dict, List, Type, Optional
 import importlib
+import importlib.util
 import sys
+import types
 from pathlib import Path
 
 
@@ -55,10 +57,10 @@ def clear_node_registry():
     _discovered_modules = set()
 
 
-def discover_nodes(nodes_dir = None, package: str = "axonforge.nodes") -> Dict[str, List[Type]]:
+def discover_nodes(nodes_dir = None, package: Optional[str] = "axonforge.nodes") -> Dict[str, List[Type]]:
     """
     Discover all node classes in the nodes directory.
-    
+
     Recursively scans Python files in the nodes directory, imports them, and registers
     any classes decorated with @branch("path"). If a Node subclass doesn't have a
     @branch decorator, it will be registered under a branch inferred from its folder path.
@@ -66,63 +68,87 @@ def discover_nodes(nodes_dir = None, package: str = "axonforge.nodes") -> Dict[s
 
     Args:
         nodes_dir: Directory to scan (defaults to axonforge/nodes)
-        package: Package name for imports
+        package: Package name for imports. When None, uses file-based importing
+                 for nodes outside the installed package (e.g. project-local nodes).
 
     Returns:
         Dictionary of discovered node branches
     """
     from ..node import Node  # Import here to avoid circular imports
-    
+
     if nodes_dir is None:
         # Find the nodes directory relative to this file
         nodes_path: Path = Path(__file__).parent.parent.parent / "nodes"
     else:
         nodes_path = Path(nodes_dir) if isinstance(nodes_dir, str) else nodes_dir
-    
+
     if not nodes_path.exists():
-        print(f"Warning: Nodes directory not found: {nodes_path}")
         return _node_branches.copy()
-    
+
     # Get all Python files recursively in the nodes directory
     py_files = list(nodes_path.rglob("*.py"))
-    
+
     for py_file in py_files:
         # Skip __init__.py directly in the nodes folder (but not in subdirectories)
         if py_file.name == "__init__.py" and py_file.parent == nodes_path:
             continue
-        
+
         # Skip files starting with underscore (private modules), but NOT __init__.py in subdirectories
         if py_file.name.startswith("_") and py_file.name != "__init__.py":
             continue
-        
+
         # Compute module path relative to nodes directory
         relative = py_file.relative_to(nodes_path)
         module_path = str(relative.with_suffix('')).replace('/', '.')
-        full_module_name = f"{package}.{module_path}"
-        
+
+        if package is not None:
+            full_module_name = f"{package}.{module_path}"
+        else:
+            # Synthetic module name for project-local nodes
+            full_module_name = f"_axonforge_project.nodes.{module_path}"
+
         # Skip already discovered modules
         if full_module_name in _discovered_modules:
             continue
-        
+
         try:
-            # Import the module to trigger decorator registration
-            if full_module_name in sys.modules:
-                # Reload if already imported
-                importlib.reload(sys.modules[full_module_name])
+            if package is not None:
+                # Standard package-based import
+                if full_module_name in sys.modules:
+                    importlib.reload(sys.modules[full_module_name])
+                else:
+                    importlib.import_module(full_module_name)
             else:
-                importlib.import_module(full_module_name)
-            
+                # File-based import for project-local nodes
+                # Register parent packages so relative imports work
+                parts = full_module_name.split(".")
+                for i in range(1, len(parts)):
+                    parent_name = ".".join(parts[:i])
+                    if parent_name not in sys.modules:
+                        parent_pkg = types.ModuleType(parent_name)
+                        parent_pkg.__package__ = parent_name
+                        parent_pkg.__path__ = [str(nodes_path / "/".join(parts[2:i]))] if i > 2 else [str(nodes_path)]
+                        sys.modules[parent_name] = parent_pkg
+
+                spec = importlib.util.spec_from_file_location(full_module_name, py_file, submodule_search_locations=[])
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                module.__package__ = ".".join(parts[:-1])
+                sys.modules[full_module_name] = module
+                spec.loader.exec_module(module)
+
             _discovered_modules.add(full_module_name)
-            
+
             # After importing, check for Node subclasses without @branch decorator
             # and register them using folder-based inference
             module = sys.modules.get(full_module_name)
             if module:
                 _register_nodes_from_module(module, relative, nodes_path)
-            
+
         except Exception as e:
             print(f"Warning: Failed to import {full_module_name}: {e}")
-    
+
     return _node_branches.copy()
 
 
@@ -188,7 +214,7 @@ def _infer_branch_from_path(relative_file_path: Path, nodes_path: Path) -> str:
     return branch_path
 
 
-def rediscover_nodes(nodes_dir: Optional[str] = None, package: str = "axonforge.nodes") -> Dict[str, List[Type]]:
+def rediscover_nodes(nodes_dir: Optional[str] = None, package: Optional[str] = "axonforge.nodes") -> Dict[str, List[Type]]:
     """
     Re-discover all nodes by clearing registry and re-scanning.
     

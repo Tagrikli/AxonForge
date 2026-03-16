@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, TYPE_CHECKING
 
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QLineF, QTimer
-from PySide6.QtGui import QPen, QColor
+from PySide6.QtGui import QCursor, QPen, QColor
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsSceneMouseEvent, QGraphicsProxyWidget, QApplication
 
 from .node_item import NodeItem
@@ -53,7 +53,8 @@ class EditorScene(QGraphicsScene):
 
         # Wire signals
         item.signals.position_changed.connect(self._on_node_moved)
-        item.signals.property_changed.connect(self._on_property_changed)
+        item.signals.name_change_requested.connect(self._on_name_change_requested)
+        item.signals.field_changed.connect(self._on_field_changed)
         item.signals.action_triggered.connect(self._on_action_triggered)
         item.signals.reload_requested.connect(self._on_reload_requested)
         if bring_to_front:
@@ -75,7 +76,21 @@ class EditorScene(QGraphicsScene):
     def remove_node_item(self, node_id: str) -> None:
         self._clear_interactions_for_node(node_id)
         item = self._node_items.pop(node_id, None)
+        dirty_rect = QRectF()
         if item:
+            dirty_rect = item.sceneBoundingRect().adjusted(-8.0, -8.0, 8.0, 8.0)
+            try:
+                item.dispose()
+            except Exception:
+                pass
+            item.setEnabled(False)
+            item.setVisible(False)
+            for child in item.childItems():
+                try:
+                    child.setEnabled(False)
+                    child.setVisible(False)
+                except Exception:
+                    pass
             self.removeItem(item)
         # Remove associated connections
         i = 0
@@ -87,6 +102,10 @@ class EditorScene(QGraphicsScene):
             else:
                 i += 1
         self._update_port_connected_states()
+        if not dirty_rect.isNull():
+            self.update(dirty_rect)
+            for view in self.views():
+                view.viewport().update()
 
     def get_node_item(self, node_id: str) -> Optional[NodeItem]:
         return self._node_items.get(node_id)
@@ -456,13 +475,31 @@ class EditorScene(QGraphicsScene):
     def delete_selected(self) -> None:
         """Delete selected node(s)."""
         selected = [item for item in self.selectedItems() if isinstance(item, NodeItem)]
-        for item in selected:
+        self._delete_node_items(selected)
+
+    def _delete_node_items(self, items: List[NodeItem]) -> None:
+        """Delete specific node items."""
+        for item in items:
             try:
                 self.bridge.delete_node(item.node_id)
             except ValueError:
                 pass
             self.remove_node_item(item.node_id)
             self._rebuild_connections()
+
+    def _hovered_interactive_item(self):
+        """Return the interactive item currently under the cursor, if any."""
+        if not self.views():
+            return None
+        view = self.views()[0]
+        view_pos = view.mapFromGlobal(QCursor.pos())
+        if not view.viewport().rect().contains(view_pos):
+            return None
+        scene_pos = view.mapToScene(view_pos)
+        if self._is_over_proxy_widget(scene_pos):
+            node = self._top_node_at(scene_pos)
+            return node
+        return self.interactive_item_at(scene_pos)
 
     def _delete_connection(self, item: ConnectionItem) -> None:
         """Delete a specific connection item directly (no selection state)."""
@@ -480,11 +517,23 @@ class EditorScene(QGraphicsScene):
     def _on_node_moved(self, node_id: str, x: float, y: float) -> None:
         self.bridge.update_node_position(node_id, x, y)
 
-    def _on_property_changed(self, node_id: str, prop_key: str, value: object) -> None:
+    def _on_name_change_requested(self, node_id: str, name: str) -> None:
+        item = self._node_items.get(node_id)
         try:
-            self.bridge.set_property(node_id, prop_key, value)
+            applied_name = self.bridge.set_node_name(node_id, name)
         except Exception as e:
-            print(f"Property update failed: {e}")
+            print(f"Node rename failed: {e}")
+            if item:
+                item.cancel_title_rename()
+            return
+        if item:
+            item.set_display_name(applied_name)
+
+    def _on_field_changed(self, node_id: str, field_key: str, value: object) -> None:
+        try:
+            self.bridge.set_field(node_id, field_key, value)
+        except Exception as e:
+            print(f"Field update failed: {e}")
 
     def _on_action_triggered(self, node_id: str, action_key: str) -> None:
         try:
@@ -513,27 +562,11 @@ class EditorScene(QGraphicsScene):
             super().mousePressEvent(event)
             return
 
-        # Right button → delete node or connection
+        # Right button → delete connections only
         if event.button() == Qt.MouseButton.RightButton:
-            if self._is_over_proxy_widget(event.scenePos()):
-                super().mousePressEvent(event)
-                return
             top_item = self.interactive_item_at(event.scenePos())
             if isinstance(top_item, ConnectionItem):
                 self._delete_connection(top_item)
-                return
-            port_item = self._port_from_interactive(top_item)
-            if port_item is not None:
-                parent = port_item.parentItem()
-                if isinstance(parent, NodeItem):
-                    self.clearSelection()
-                    parent.setSelected(True)
-                    self.delete_selected()
-                    return
-            if isinstance(top_item, NodeItem):
-                self.clearSelection()
-                top_item.setSelected(True)
-                self.delete_selected()
                 return
         if event.button() == Qt.MouseButton.LeftButton:
             scene_pos = event.scenePos()
@@ -631,6 +664,34 @@ class EditorScene(QGraphicsScene):
             self.duplicate_selected()
             return
 
+        # Shift+X → delete selected node(s)
+        if event.key() == Qt.Key.Key_X and event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
+            hovered = self._hovered_interactive_item()
+            if isinstance(hovered, ConnectionItem):
+                self._delete_connection(hovered)
+                event.accept()
+                return
+
+            hovered_port = self._port_from_interactive(hovered)
+            hovered_node = None
+            if isinstance(hovered, NodeItem):
+                hovered_node = hovered
+            elif hovered_port is not None:
+                parent = hovered_port.parentItem()
+                if isinstance(parent, NodeItem):
+                    hovered_node = parent
+
+            selected_nodes = [item for item in self.selectedItems() if isinstance(item, NodeItem)]
+            if hovered_node is not None:
+                if hovered_node in selected_nodes and selected_nodes:
+                    self._delete_node_items(selected_nodes)
+                else:
+                    self._delete_node_items([hovered_node])
+            else:
+                self._delete_node_items(selected_nodes)
+            event.accept()
+            return
+
         super().keyPressEvent(event)
 
     def duplicate_selected(self) -> None:
@@ -647,17 +708,17 @@ class EditorScene(QGraphicsScene):
             try:
                 new_node = self.bridge.create_node(node_type, x, y)
                 new_item = self.add_node_item(new_node.get_schema())
-                # Copy properties from original to new node
-                self._copy_node_properties(item, new_item)
+                # Copy fields from original to new node
+                self._copy_node_fields(item, new_item)
             except Exception as e:
                 print(f"Failed to duplicate node: {e}")
 
-    def _copy_node_properties(self, source_item: NodeItem, target_item: NodeItem) -> None:
-        """Copy property values from source node to target node."""
-        for prop in source_item.schema.get("properties", []):
-            key = prop.get("key")
-            if key and prop.get("value") is not None:
+    def _copy_node_fields(self, source_item: NodeItem, target_item: NodeItem) -> None:
+        """Copy field values from source node to target node."""
+        for field in source_item.schema.get("fields", []):
+            key = field.get("key")
+            if key and field.get("value") is not None:
                 try:
-                    self.bridge.set_property(target_item.node_id, key, prop["value"])
+                    self.bridge.set_field(target_item.node_id, key, field["value"])
                 except Exception as e:
-                    print(f"Failed to copy property {key}: {e}")
+                    print(f"Failed to copy field {key}: {e}")

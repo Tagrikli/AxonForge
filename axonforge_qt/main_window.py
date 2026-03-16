@@ -1,14 +1,14 @@
 """
-MainWindow — QMainWindow assembling header, palette, canvas, and console.
+MainWindow — QMainWindow assembling header, palette, canvas, console, and graph panel.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QEvent
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
-    QPushButton, QFileDialog, QSplitter, QCheckBox, QSpinBox, QMessageBox,
+    QPushButton, QSplitter, QCheckBox, QSpinBox, QMessageBox,
 )
 
 from .bridge import BridgeAPI
@@ -17,6 +17,7 @@ from .canvas.editor_scene import EditorScene
 from .canvas.editor_view import EditorView
 from .panels.palette import PalettePanel
 from .panels.console import ConsolePanel
+from .panels.graph_panel import GraphPanel
 
 
 class MainWindow(QMainWindow):
@@ -28,11 +29,13 @@ class MainWindow(QMainWindow):
         self._ui_fps = ui_fps
         self._palette_last_width = 260
         self._palette_collapsed = True
+        self._graph_panel_last_width = 200
+        self._graph_panel_collapsed = True
         self._console_last_height = 220
         self._console_collapsed = False
         self._syncing_editor_state = False
         self._viewport_apply_token = 0
-        self._project_transition_active = False
+        self._transition_active = False
         self._window_closing = False
         self._retired_scenes: list[EditorScene] = []
         self._resize_anchor_horizontal: tuple[QPoint, QPointF] | None = None
@@ -54,7 +57,7 @@ class MainWindow(QMainWindow):
         self._header_bar = self._build_header()
         root_layout.addWidget(self._header_bar)
 
-        # ── Body: palette + canvas ───────────────────────────────────────
+        # ── Body: palette + canvas + graph panel ─────────────────────────
         body = QWidget()
         body_layout = QHBoxLayout(body)
         body_layout.setContentsMargins(0, 0, 0, 0)
@@ -63,14 +66,23 @@ class MainWindow(QMainWindow):
         self._palette = PalettePanel(bridge)
         self._scene = EditorScene(bridge)
         self._view = EditorView(self._scene)
+        self._graph_panel = GraphPanel(bridge)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.addWidget(self._palette)
         self._splitter.addWidget(self._view)
-        self._splitter.setStretchFactor(0, 0)
-        self._splitter.setStretchFactor(1, 1)
+        self._splitter.addWidget(self._graph_panel)
+        self._splitter.setStretchFactor(0, 0)  # palette: fixed
+        self._splitter.setStretchFactor(1, 1)  # canvas: stretches
+        self._splitter.setStretchFactor(2, 0)  # graph panel: fixed
         self._splitter.splitterMoved.connect(self._on_splitter_moved)
         body_layout.addWidget(self._splitter)
+
+        # Connect graph panel signals
+        self._graph_panel.graph_switch_requested.connect(self._switch_graph)
+        self._graph_panel.graph_new_requested.connect(lambda: self._new_graph(None))
+        self._graph_panel.graph_delete_requested.connect(self._delete_graph)
+        self._graph_panel.graph_rename_requested.connect(self._rename_graph)
 
         # ── Console panel ────────────────────────────────────────────────
         self._console = ConsolePanel(bridge)
@@ -92,8 +104,9 @@ class MainWindow(QMainWindow):
         if v_handle is not None:
             v_handle.installEventFilter(self)
 
-        # Start with drawer collapsed.
+        # Start with drawers collapsed.
         self._set_palette_collapsed(True)
+        self._set_graph_panel_collapsed(True)
 
         # ── Computation thread ───────────────────────────────────────────
         self._comp_thread = ComputationThread(bridge)
@@ -108,8 +121,11 @@ class MainWindow(QMainWindow):
         # ── Keyboard shortcuts ───────────────────────────────────────────
         self._add_shortcut("Ctrl+Space", self._toggle_network)
         self._add_shortcut("Ctrl+Return", self._step_network)
-        self._add_shortcut("Shift+T", self._toggle_console)
-        self._add_shortcut("Shift+R", self._toggle_palette_drawer)
+        self._add_shortcut("Shift+W", self._toggle_console)
+        self._add_shortcut("Shift+Q", self._toggle_palette_drawer)
+        self._add_shortcut("Shift+E", self._toggle_graph_panel)
+        self._add_shortcut("Ctrl+N", lambda: self._new_graph(None))
+        self._add_shortcut("Ctrl+S", self._save_graph)
 
         # ── Load initial topology ────────────────────────────────────────
         self._load_initial_state()
@@ -123,34 +139,8 @@ class MainWindow(QMainWindow):
         self._shortcuts.append(shortcut)
 
     def _build_menu_bar(self) -> None:
-        """Create application menu bar with project actions."""
-        menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("File")
-
-        self._new_project_action = QAction("New Project", self)
-        self._new_project_action.setShortcut(QKeySequence("Ctrl+N"))
-        self._new_project_action.triggered.connect(self._new_project)
-        file_menu.addAction(self._new_project_action)
-
-        self._load_project_action = QAction("Load Project", self)
-        self._load_project_action.setShortcut(QKeySequence("Ctrl+O"))
-        self._load_project_action.triggered.connect(self._load_project_dialog)
-        file_menu.addAction(self._load_project_action)
-
-        self._save_project_action = QAction("Save Project", self)
-        self._save_project_action.setShortcut(QKeySequence("Ctrl+S"))
-        self._save_project_action.triggered.connect(self._save_project)
-        file_menu.addAction(self._save_project_action)
-
-        self._close_project_action = QAction("Close Project", self)
-        self._close_project_action.triggered.connect(
-            lambda checked=False: QTimer.singleShot(0, self._close_project)
-        )
-        file_menu.addAction(self._close_project_action)
-
-        file_menu.addSeparator()
-        self._recent_projects_menu = file_menu.addMenu("Recent Projects")
-        self._recent_projects_menu.aboutToShow.connect(self._refresh_recent_projects_menu)
+        """Create application menu bar."""
+        self.menuBar().hide()
 
     def _build_header(self) -> QWidget:
         header = QWidget()
@@ -164,9 +154,14 @@ class MainWindow(QMainWindow):
         title = QLabel("AxonForge")
         title.setObjectName("app_title")
         layout.addWidget(title)
-        self._workspace_label = QLabel("unsaved")
+        self._workspace_label = QLabel("")
         self._workspace_label.setObjectName("workspace_label")
         layout.addWidget(self._workspace_label)
+        self._workspace_dirty_indicator = QWidget()
+        self._workspace_dirty_indicator.setObjectName("workspace_dirty_indicator")
+        self._workspace_dirty_indicator.setFixedSize(8, 8)
+        self._workspace_dirty_indicator.setVisible(False)
+        layout.addWidget(self._workspace_dirty_indicator)
 
         layout.addStretch()
 
@@ -211,40 +206,22 @@ class MainWindow(QMainWindow):
         topology = self.bridge.get_topology()
         self._scene.rebuild_from_topology(topology)
         self._apply_viewport_state(topology.get("viewport", {}))
-        self._update_project_ui()
+        self._update_header_label()
         self._apply_editor_state()
 
-    def _project_display_name(self) -> str:
-        return self.bridge.current_project_name
-
-    def _update_project_ui(self) -> None:
-        self._workspace_label.setText(self._project_display_name())
-
-    def _refresh_recent_projects_menu(self) -> None:
-        self._recent_projects_menu.clear()
-        projects = self.bridge.list_recent_projects()
-        if not projects:
-            action = QAction("No projects", self)
-            action.setEnabled(False)
-            self._recent_projects_menu.addAction(action)
-            return
-
-        for project_path in projects:
-            action = QAction(project_path, self)
-            # Use QTimer.singleShot to defer loading. This prevents a crash where the
-            # QAction (the sender) is deleted by _refresh_recent_projects_menu()
-            # while its triggered signal is still being handled.
-            action.triggered.connect(
-                lambda checked=False, p=project_path: QTimer.singleShot(0, lambda: self._load_project(p))
-            )
-            self._recent_projects_menu.addAction(action)
+    def _update_header_label(self) -> None:
+        project = self.bridge.project_name
+        graph = self.bridge.current_graph_display_name
+        self._workspace_label.setText(f"{project} / {graph}")
+        self._workspace_dirty_indicator.setVisible(self.bridge.current_graph_has_unsaved_state())
 
     # ── UI refresh ───────────────────────────────────────────────────────
 
     def _on_refresh_tick(self) -> None:
-        if self._project_transition_active or self._window_closing:
+        if self._transition_active or self._window_closing:
             return
         self.bridge.poll_background_init_jobs()
+        self._update_header_label()
         buf = self.bridge.read_display_buffer()
         if buf is not None:
             self._scene.update_displays(buf)
@@ -342,7 +319,8 @@ class MainWindow(QMainWindow):
             sizes = self._splitter.sizes()
             if sizes and sizes[0] > 40:
                 self._palette_last_width = int(sizes[0])
-            self._splitter.setSizes([0, total])
+            graph_w = sizes[2] if len(sizes) > 2 else 0
+            self._splitter.setSizes([0, total - graph_w, graph_w])
             self._palette_collapsed = True
             QTimer.singleShot(
                 0,
@@ -356,7 +334,8 @@ class MainWindow(QMainWindow):
             return
 
         target = max(200, min(self._palette_last_width, int(total * 0.45)))
-        self._splitter.setSizes([target, max(1, total - target)])
+        graph_w = sizes_now[2] if len(sizes_now) > 2 else 0
+        self._splitter.setSizes([target, max(1, total - target - graph_w), graph_w])
         self._palette_collapsed = False
         QTimer.singleShot(
             0,
@@ -370,6 +349,30 @@ class MainWindow(QMainWindow):
 
     def _toggle_palette_drawer(self) -> None:
         self._set_palette_collapsed(not self._palette_collapsed)
+
+    def _set_graph_panel_collapsed(self, collapsed: bool) -> None:
+        anchor_global, anchor_scene = self._capture_view_anchor()
+        sizes_now = self._splitter.sizes()
+        total = max(sum(sizes_now), self._splitter.width(), 1)
+        palette_w = sizes_now[0] if sizes_now else 0
+
+        if collapsed:
+            if len(sizes_now) > 2 and sizes_now[2] > 40:
+                self._graph_panel_last_width = int(sizes_now[2])
+            self._splitter.setSizes([palette_w, total - palette_w, 0])
+            self._graph_panel_collapsed = True
+        else:
+            target = max(160, min(self._graph_panel_last_width, int(total * 0.3)))
+            self._splitter.setSizes([palette_w, max(1, total - palette_w - target), target])
+            self._graph_panel_collapsed = False
+
+        QTimer.singleShot(
+            0,
+            lambda ag=anchor_global, asc=anchor_scene: self._restore_view_anchor(ag, asc),
+        )
+
+    def _toggle_graph_panel(self) -> None:
+        self._set_graph_panel_collapsed(not self._graph_panel_collapsed)
 
     def _capture_view_anchor(self) -> tuple[QPoint, QPointF]:
         """Capture a stable anchor in scene space before layout changes."""
@@ -415,27 +418,25 @@ class MainWindow(QMainWindow):
         error_msg = f"Network error in '{node_name}': {error}"
         print(error_msg)
         print(tb)
-        # Also log to console panel if available
         if hasattr(self, '_console'):
             self._console.append_message(error_msg, is_error=True)
             self._console.append_message(tb, is_error=True)
-        # Ensure the node shows error state immediately
         node_item = self._scene._node_items.get(node_id)
         if node_item:
             node_item.set_error_state(True, error)
 
     def _toggle_console(self) -> None:
-        """Toggle console panel visibility with Shift+T shortcut."""
+        """Toggle console panel visibility with Shift+W shortcut."""
         if hasattr(self, '_console'):
             self._set_console_collapsed(not self._console_collapsed)
 
-    # ── Project ─────────────────────────────────────────────────────────
+    # ── Graph switching ──────────────────────────────────────────────────
 
-    def _begin_project_transition(self) -> None:
-        """Stop background activity before tearing down project state."""
-        if self._project_transition_active:
+    def _begin_transition(self) -> None:
+        """Stop background activity before tearing down graph state."""
+        if self._transition_active:
             return
-        self._project_transition_active = True
+        self._transition_active = True
         self._viewport_apply_token += 1
         self._refresh_timer.stop()
         self._refresh_timer.blockSignals(True)
@@ -443,13 +444,13 @@ class MainWindow(QMainWindow):
             self._comp_thread.request_stop()
             self._comp_thread.wait()
 
-    def _end_project_transition(self) -> None:
-        """Restart background activity after project state is ready."""
-        if not self._project_transition_active:
+    def _end_transition(self) -> None:
+        """Restart background activity after graph state is ready."""
+        if not self._transition_active:
             return
         if self._window_closing:
             old_thread = self._comp_thread
-            self._project_transition_active = False
+            self._transition_active = False
             try:
                 old_thread.deleteLater()
             except Exception:
@@ -459,7 +460,7 @@ class MainWindow(QMainWindow):
         self._comp_thread = ComputationThread(self.bridge)
         self._comp_thread.network_error.connect(self._on_network_error)
         self._comp_thread.start()
-        self._project_transition_active = False
+        self._transition_active = False
         self._refresh_timer.blockSignals(False)
         self._refresh_timer.start(int(1000.0 / self._ui_fps))
         try:
@@ -489,100 +490,138 @@ class MainWindow(QMainWindow):
         self._view.viewport().update()
         self._view.update()
 
-    def _close_project_impl(self) -> None:
-        """Clear all project state and rebuild an empty scene."""
-        self.bridge.clear_workspace()
-        topology = self.bridge.get_topology()
-        self._rebuild_scene(topology)
-        self._update_project_ui()
-
-    def _autosave_current_project(self) -> None:
-        """Persist the current saved project before switching away from it."""
-        target_dir = self.bridge.current_project_dir
-        if target_dir is None:
+    def _autosave_current_graph(self) -> None:
+        """Save the current graph if it has a name."""
+        if self.bridge.current_graph_name is None:
+            return
+        if not self.bridge.current_graph_dirty:
             return
         self._snapshot_viewport_state()
         self._snapshot_editor_state()
-        self.bridge.save_project(target_dir)
+        self.bridge.save_graph(self.bridge.current_graph_name)
 
-    def _close_project(self) -> None:
-        try:
-            self._autosave_current_project()
-        except Exception as e:
-            print(f"Failed to save project before close: {e}")
-        self._begin_project_transition()
-        try:
-            # Avoid resetting the view during close; it can crash during teardown.
-            self._close_project_impl()
-        finally:
-            self._end_project_transition()
+    def _show_graph_name_entry(self) -> None:
+        self._set_graph_panel_collapsed(False)
+        self._graph_panel.refresh()
+        QTimer.singleShot(0, self._graph_panel.begin_rename_current_graph)
 
-    def _load_project(self, project_dir: str) -> None:
-        try:
-            self._autosave_current_project()
-        except Exception as e:
-            print(f"Failed to save project before load: {e}")
-        self._begin_project_transition()
-        try:
-            # Close current project before loading a new one
-            self._close_project_impl()
-            self.bridge.load_project(project_dir)
-            topology = self.bridge.get_topology()
-            self._rebuild_scene(topology)
-            self._schedule_viewport_state(topology.get("viewport", {}))
-            self._update_project_ui()
-            self._apply_editor_state()
-        except Exception as e:
-            print(f"Failed to load project: {e}")
-        finally:
-            self._end_project_transition()
-
-    def _load_project_dialog(self) -> None:
-        project_dir = QFileDialog.getExistingDirectory(
+    def _confirm_discard_unnamed_graph(self, action_text: str) -> bool:
+        if self.bridge.current_graph_name is not None:
+            return True
+        if not self.bridge.current_graph_has_unsaved_state():
+            return True
+        result = QMessageBox.question(
             self,
-            "Load Project",
-            str(self.bridge.current_project_dir or ""),
+            "Unsaved Graph",
+            (
+                "The current graph has no name and has not been saved.\n\n"
+                f"{action_text}"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        if project_dir:
-            self._load_project(project_dir)
+        if result == QMessageBox.StandardButton.Yes:
+            return True
+        self._show_graph_name_entry()
+        return False
 
-    def _save_project(self) -> None:
-        target_dir = self.bridge.current_project_dir
-        if target_dir is None:
-            chosen = QFileDialog.getExistingDirectory(self, "Save Project")
-            if not chosen:
-                return
-            target_dir = chosen
+    def _save_graph_with_name(self, name: str) -> None:
         self._snapshot_viewport_state()
         self._snapshot_editor_state()
-        self.bridge.save_project(target_dir)
-        self._update_project_ui()
+        self.bridge.save_graph(name)
+        self._update_header_label()
+        self._graph_panel.refresh()
 
-    def _new_project(self) -> None:
-        project_dir = QFileDialog.getExistingDirectory(self, "New Project")
-        if not project_dir:
+    def _switch_graph(self, name: str) -> None:
+        """Switch to a different graph."""
+        if not self._confirm_discard_unnamed_graph("Switch graphs anyway?"):
             return
-
         try:
-            self._autosave_current_project()
+            self._autosave_current_graph()
         except Exception as e:
-            print(f"Failed to save project before creating a new one: {e}")
-        self._begin_project_transition()
+            print(f"Failed to save graph before switch: {e}")
+        self._begin_transition()
         try:
-            # Close current project before creating a new one
-            self._close_project_impl()
-            self.bridge.new_project(project_dir)
+            self.bridge.load_graph(name)
             topology = self.bridge.get_topology()
             self._rebuild_scene(topology)
             self._schedule_viewport_state(topology.get("viewport", {}))
-            self._update_project_ui()
+            self._update_header_label()
             self._apply_editor_state()
-            self._snapshot_viewport_state()
-            self._snapshot_editor_state()
-            self.bridge.save_project(project_dir)
-            self._update_project_ui()
+        except Exception as e:
+            print(f"Failed to load graph: {e}")
         finally:
-            self._end_project_transition()
+            self._end_transition()
+        self._graph_panel.refresh()
+
+    def _new_graph(self, name: str | None = None) -> None:
+        """Create a new empty graph and switch to it."""
+        if not self._confirm_discard_unnamed_graph("Create another graph anyway?"):
+            return
+        try:
+            self._autosave_current_graph()
+        except Exception as e:
+            print(f"Failed to save graph before creating new: {e}")
+        self._begin_transition()
+        try:
+            self.bridge.new_graph(name)
+            topology = self.bridge.get_topology()
+            self._rebuild_scene(topology)
+            self._update_header_label()
+        finally:
+            self._end_transition()
+        self._graph_panel.refresh()
+
+    def _delete_graph(self, name: str) -> None:
+        """Delete a graph file."""
+        is_active = (name == self.bridge.current_graph_name)
+        if is_active:
+            self._begin_transition()
+        try:
+            self.bridge.delete_graph(name)
+            if is_active:
+                topology = self.bridge.get_topology()
+                self._rebuild_scene(topology)
+                self._update_header_label()
+        finally:
+            if is_active:
+                self._end_transition()
+        self._graph_panel.refresh()
+
+    def _rename_graph(self, old_name: object, new_name: str) -> None:
+        """Rename a graph file."""
+        clean_name = new_name.strip()
+        if not clean_name:
+            return
+        existing = set(self.bridge.list_graphs())
+        if clean_name in existing and clean_name != old_name:
+            QMessageBox.warning(
+                self,
+                "Graph Name In Use",
+                f"A graph named '{clean_name}' already exists.",
+            )
+            return
+
+        if old_name is None:
+            self._save_graph_with_name(clean_name)
+        elif old_name == self.bridge.current_graph_name:
+            self._save_graph_with_name(clean_name)
+            if old_name != clean_name:
+                self.bridge.delete_graph(old_name)
+        else:
+            self.bridge.rename_graph(old_name, clean_name)
+        self._update_header_label()
+        self._graph_panel.refresh()
+
+    def _save_graph(self) -> None:
+        """Save the current graph (Ctrl+S)."""
+        name = self.bridge.current_graph_name
+        if name is None:
+            self._show_graph_name_entry()
+            return
+        self._save_graph_with_name(name)
+
+    # ── Viewport & editor state ──────────────────────────────────────────
 
     def _snapshot_viewport_state(self) -> None:
         viewport = self._view.viewport()
@@ -730,26 +769,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._window_closing = True
-        if self.bridge.current_project_dir is None:
-            result = QMessageBox.question(
-                self,
-                "Unsaved Project",
-                "This project has not been saved. Are you sure you want to close?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if result != QMessageBox.StandardButton.Yes:
-                self._window_closing = False
-                event.ignore()
-                return
-        else:
-            try:
-                self._snapshot_viewport_state()
-                self._snapshot_editor_state()
-                self.bridge.save_project(self.bridge.current_project_dir)
-            except Exception as e:
-                print(f"Failed to save project on close: {e}")
+        if not self._confirm_discard_unnamed_graph("Quit anyway?"):
+            self._window_closing = False
+            event.ignore()
+            return
 
-        self._begin_project_transition()
+        if self.bridge.current_graph_name is not None:
+            try:
+                self._save_graph_with_name(self.bridge.current_graph_name)
+            except Exception as e:
+                print(f"Failed to save graph on close: {e}")
+
+        self._begin_transition()
         self.bridge.shutdown_background_workers()
         super().closeEvent(event)

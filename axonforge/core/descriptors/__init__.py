@@ -1,8 +1,8 @@
-from .base import BaseDescriptor, Property, Display
+from .base import BaseDescriptor, Field, Display
 from .ports import InputPort, OutputPort
-from .properties import Range, Integer, Bool, Enum
+from .fields import Range, Integer, Float, Bool, Enum, DirectoryPath, FilePath, FilePaths
 from .actions import Action
-from .store import Store
+from .state import State
 from .node import (
     branch,
     get_node_branches,
@@ -15,16 +15,20 @@ from .node import (
 
 __all__ = [
     "BaseDescriptor",
-    "Property",
+    "Field",
     "Display",
     "Action",
     "InputPort",
     "OutputPort",
     "Range",
     "Integer",
+    "Float",
     "Bool",
     "Enum",
-    "Store",
+    "DirectoryPath",
+    "FilePath",
+    "FilePaths",
+    "State",
     "branch",
     "get_node_branches",
     "get_all_node_classes",

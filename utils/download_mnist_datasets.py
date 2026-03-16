@@ -1,129 +1,49 @@
 #!/usr/bin/env python3
 """
-Download MNIST and Fashion-MNIST IDX files (gzip) for use with `python-mnist`.
+Prefetch MNIST and Fashion-MNIST into the AxonForge cache directory.
 
-Output layout:
-  data/mnist/mnist/
-  data/mnist/fashion-mnist/
-
-The input nodes in this project are configured to look in these locations.
+This script downloads the raw IDX files into the user cache and leaves the
+project directory untouched.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
 import sys
-import gzip
-import shutil
 
 
-DATASETS = {
-    "mnist": {
-        "base_urls": [
-            "https://storage.googleapis.com/cvdf-datasets/mnist",
-        ],
-        "files": [
-            "train-images-idx3-ubyte.gz",
-            "train-labels-idx1-ubyte.gz",
-            "t10k-images-idx3-ubyte.gz",
-            "t10k-labels-idx1-ubyte.gz",
-        ],
-    },
-    "fashion-mnist": {
-        "base_urls": [
-            "https://fashion-mnist.s3-website.eu-central-1.amazonaws.com",
-            "https://raw.githubusercontent.com/zalandoresearch/fashion-mnist/master/data/fashion",
-            "https://github.com/zalandoresearch/fashion-mnist/raw/master/data/fashion",
-        ],
-        "files": [
-            "train-images-idx3-ubyte.gz",
-            "train-labels-idx1-ubyte.gz",
-            "t10k-images-idx3-ubyte.gz",
-            "t10k-labels-idx1-ubyte.gz",
-        ],
-    },
-}
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-
-def download_file(url: str, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    req = Request(url, headers={"User-Agent": "MiniCortex dataset downloader"})
-    with urlopen(req) as resp, dest.open("wb") as f:
-        while True:
-            chunk = resp.read(1024 * 64)
-            if not chunk:
-                break
-            f.write(chunk)
+from axonforge.nodes.utilities.dataset_cache import (
+    _ensure_mnist_source_available,
+    _resolve_dataset_raw_dir,
+)
 
 
 def main() -> int:
-    repo_root = Path(__file__).resolve().parents[1]
-    target_root = repo_root / "data" / "mnist"
-    print(f"Target root: {target_root}")
-
+    dataset_names = ("mnist", "fashion_mnist")
     failures = []
-    for dataset_name, spec in DATASETS.items():
-        dataset_dir = target_root / dataset_name
-        print(f"\n[{dataset_name}] -> {dataset_dir}")
-        dataset_dir.mkdir(parents=True, exist_ok=True)
-        for filename in spec["files"]:
-            gz_filename = filename
-            uncompressed_filename = gz_filename[:-3]
-            gz_dest = dataset_dir / gz_filename
-            uncompressed_dest = dataset_dir / uncompressed_filename
 
-            if uncompressed_dest.exists() and uncompressed_dest.stat().st_size > 0:
-                print(f"  skip  {uncompressed_filename} (exists)")
-                continue
-
-            # Ensure gzipped file exists
-            if not gz_dest.exists() or gz_dest.stat().st_size == 0:
-                print(f"  fetch {gz_filename}")
-                last_error = None
-                for base_url in spec["base_urls"]:
-                    url = f"{base_url}/{gz_filename}"
-                    try:
-                        download_file(url, gz_dest)
-                        last_error = None
-                        break
-                    except (HTTPError, URLError, OSError) as exc:
-                        last_error = exc
-                        print(f"  fail  {gz_filename} @ {base_url}: {exc}")
-                        if gz_dest.exists():
-                            try:
-                                gz_dest.unlink()
-                            except OSError:
-                                pass
-                if last_error is not None:
-                    failures.append((gz_filename, str(last_error)))
-                    continue
-
-            # Decompress
-            print(f"  decompress {gz_filename}")
-            try:
-                with gzip.open(gz_dest, 'rb') as f_in:
-                    with open(uncompressed_dest, 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-                print(f"  -> {uncompressed_filename}")
-                # Clean up gz file after successful decompress
-                gz_dest.unlink(missing_ok=True)
-            except Exception as exc:
-                print(f"  decompress fail {gz_filename}: {exc}")
-                if uncompressed_dest.exists():
-                    uncompressed_dest.unlink()
-                failures.append((f"decompress {gz_filename}", str(exc)))
+    for dataset_name in dataset_names:
+        target_dir = _resolve_dataset_raw_dir(dataset_name)
+        print(f"[{dataset_name}] -> {target_dir}")
+        prepared = _ensure_mnist_source_available(dataset_name)
+        if prepared is None:
+            failures.append(dataset_name)
+        else:
+            print(f"  ready: {prepared}")
 
     if failures:
-        print("\nSome downloads failed:", file=sys.stderr)
-        for filename, err in failures:
-            print(f"  - {filename}: {err}", file=sys.stderr)
+        print("\nSome dataset downloads failed:", file=sys.stderr)
+        for name in failures:
+            print(f"  - {name}", file=sys.stderr)
         return 1
 
     print("\nDone.")
-    print("MNIST directory: data/mnist/mnist")
-    print("Fashion-MNIST directory: data/mnist/fashion-mnist")
+    for dataset_name in dataset_names:
+        print(f"{dataset_name}: {_resolve_dataset_raw_dir(dataset_name)}")
     return 0
 
 

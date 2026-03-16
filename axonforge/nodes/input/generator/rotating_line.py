@@ -4,10 +4,10 @@ import numpy as np
 
 from ....core.node import Node
 from ....core.descriptors.ports import InputPort, OutputPort
-from ....core.descriptors.properties import Range, Integer, Bool, Enum
-from ....core.descriptors.displays import Vector2D, Text
+from ....core.descriptors.fields import Range, Integer, Bool, Enum
+from ....core.descriptors.displays import Heatmap, Text
 from ....core.descriptors.actions import Action
-from ....core.descriptors.store import Store
+from ....core.descriptors.state import State
 from ....core.descriptors import branch
 
 
@@ -16,7 +16,7 @@ class InputRotatingLine(Node):
 
     output_pattern = OutputPort("Pattern", np.ndarray)
     output_angle = OutputPort("Angle", float)
-    pattern = Vector2D("Pattern", color_mode="grayscale")
+    pattern = Heatmap("Pattern", colormap="grayscale")
     info = Text("Info", default="Angle: 0°")
 
     # Properties
@@ -30,14 +30,14 @@ class InputRotatingLine(Node):
     random_mode = Bool("Random Mode", default=False)
 
     # Buttons
-    prev_pattern = Action("Prev", callback="_on_prev")
-    next_pattern = Action("Next", callback="_on_next")
+    prev_pattern = Action("Prev", lambda self, params=None: self._on_prev(params))
+    next_pattern = Action("Next", lambda self, params=None: self._on_next(params))
 
-    # Store
-    angle = Store(default=0.0)
-    target_angle = Store(default=0.0)
-    interp_progress = Store(default=0.0)
-    start_angle = Store(default=0.0)
+    # State
+    angle = State(default=0.0)
+    target_angle = State(default=0.0)
+    interp_progress = State(default=0.0)
+    start_angle = State(default=0.0)
 
     def init(self):
         self._generate_new_target()

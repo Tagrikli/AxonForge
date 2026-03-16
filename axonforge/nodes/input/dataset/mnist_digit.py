@@ -1,13 +1,14 @@
-"""Dataset input nodes for MiniCortex."""
+"""MNIST digit input node."""
 
 import numpy as np
 
-from ....core.descriptors.displays import Text, Vector2D
+from ....core.descriptors.actions import Action
+from ....core.descriptors.displays import Text, Heatmap
 from ....core.descriptors.ports import OutputPort
-from ....core.descriptors.properties import Integer, Range
-from ....core.descriptors.store import Store
+from ....core.descriptors.fields import Integer, Range
+from ....core.descriptors.state import State
 from ....core.node import Node, background_init
-from ....nodes.utilities import _load_dataset_with_python_mnist
+from ....nodes.utilities.dataset_cache import load_dataset_with_python_mnist
 
 
 class InputDigitMNIST(Node):
@@ -15,53 +16,82 @@ class InputDigitMNIST(Node):
 
     output_pattern = OutputPort("Pattern", np.ndarray)
     output_digit = OutputPort("Digit", int)
-    pattern = Vector2D("Pattern", color_mode="grayscale")
+    pattern = Heatmap("Pattern", colormap="grayscale")
     digit = Text("Digit", default="0")
 
-    # Property: how many times to repeat each image
-    repeat_count = Integer("Repeat", default=1)
-
-    # Property: digit filter (-1 = all, 0-9 = specific digit class)
     digit_filter = Range("Digit Filter", default=-1, min_val=-1, max_val=9, step=1)
+    repeat = Integer("Repeat", default=1)
 
-    # Store: index and step counter
-    idx = Store(default=0)
-    repeat_counter = Store(default=0)
-    size = Store(default=28)
+    next_button = Action("Next", lambda self, params=None: self.next_digit(params))
+    prev_button = Action("Prev", lambda self, params=None: self.prev_digit(params))
+
+    idx = State(default=0)
+    repeat_counter = State(default=0)
 
     @background_init
     def init(self):
-        self._images, self._labels = _load_dataset_with_python_mnist("mnist")
-        # Build indices for each digit class (0-9)
+        self._images, self._labels = load_dataset_with_python_mnist("mnist")
+
+        # Shuffle the entire dataset so sequential access isn't in label order
+        perm = np.random.permutation(len(self._images))
+        self._images = self._images[perm]
+        self._labels = self._labels[perm]
+
+        # Build per-digit index lists (indices into the shuffled arrays)
         self._class_indices = {}
-        if self._labels is not None:
-            for digit in range(10):
-                self._class_indices[digit] = np.where(self._labels == digit)[0]
-        self._update_pattern()
+        for d in range(10):
+            self._class_indices[d] = np.where(self._labels == d)[0]
+
+        self._update_output()
 
     def process(self):
+        if self._images is None:
+            return
+
+        rep = int(self.repeat)
+        if rep <= 0:
+            # Frozen — only Prev/Next buttons move the index
+            self._update_output()
+            return
+
+        self.repeat_counter = int(self.repeat_counter) + 1
+        if int(self.repeat_counter) >= rep:
+            self.repeat_counter = 0
+            self._advance(1)
+
+        self._update_output()
+
+    def next_digit(self, params=None):
         if self._images is not None:
-            # Increment repeat counter
-            self.repeat_counter = int(self.repeat_counter) + 1
+            self._advance(1)
+            self._update_output()
 
-            # Only advance to next digit when repeat_count is reached
-            if int(self.repeat_counter) >= int(self.repeat_count):
-                filter_val = int(self.digit_filter)
-                if filter_val == -1:
-                    # Current behavior: sequential through all images
-                    self.idx = (int(self.idx) + 1) % len(self._images)
-                else:
-                    # Pick random image from the specified digit class
-                    indices = self._class_indices.get(filter_val, [])
-                    if len(indices) > 0:
-                        self.idx = np.random.choice(indices)
-                self.repeat_counter = 0
-
-        self._update_pattern()
-
-    def _update_pattern(self):
+    def prev_digit(self, params=None):
         if self._images is not None:
-            self.output_pattern = self._images[self.idx]
-            self.pattern = self._images[self.idx]
-            self.output_digit = int(self._labels[self.idx])
-            self.digit = str(self._labels[self.idx])
+            self._advance(-1)
+            self._update_output()
+
+    def _advance(self, direction):
+        """Move index by `direction` (+1 or -1) within the current filter."""
+        filt = int(self.digit_filter)
+        if filt == -1:
+            # All digits — walk through the shuffled dataset
+            self.idx = (int(self.idx) + direction) % len(self._images)
+        else:
+            # Filtered to a specific digit class
+            indices = self._class_indices.get(filt, [])
+            if len(indices) == 0:
+                return
+            # Find where our current idx sits in the class list
+            pos = np.searchsorted(indices, int(self.idx))
+            pos = (pos + direction) % len(indices)
+            self.idx = int(indices[pos])
+
+    def _update_output(self):
+        if self._images is None:
+            return
+        i = int(self.idx)
+        self.output_pattern = self._images[i]
+        self.pattern = self._images[i]
+        self.output_digit = int(self._labels[i])
+        self.digit = str(self._labels[i])

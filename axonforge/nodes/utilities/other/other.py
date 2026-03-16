@@ -4,7 +4,7 @@ import numpy as np
 
 from axonforge.core.node import Node
 from axonforge.core.descriptors.ports import InputPort, OutputPort
-from axonforge.core.descriptors.properties import Integer, Range, Float as FloatProp, Enum
+from axonforge.core.descriptors.fields import Integer, Range, Float as FloatProp, Enum
 from axonforge.core.descriptors.displays import Text, Numeric
 
 
@@ -65,7 +65,7 @@ class TopK(Node):
         if self.input_data is None:
             return
 
-        # Store original shape
+        # State original shape
         original_shape = self.input_data.shape
 
         # Flatten the array

@@ -34,21 +34,21 @@ def dynamic(cls_or_label: Optional[str] = None):
     
     - Reload the module from disk
     - Create a new instance with the updated class
-    - Preserve Property values
+    - Preserve Field values
     - Remove invalid connections (ports that no longer exist)
     - Call init() on the new instance
     
     What is PRESERVED across reload:
-    - Property values (user-adjusted settings)
+    - Field values (user-adjusted settings)
     - Node position
     - Node name
     - Connections to valid ports
     
     What is REINITIALIZED after reload:
-    - Store values (internal state variables) - NOT preserved
+    - State values (internal state variables) - NOT preserved
     - The process() method (new code)
     - InputPort/OutputPort definitions
-    - Property definitions (defaults, ranges)
+    - Field definitions (defaults, ranges)
     - Action definitions
     - Display definitions
     - The init() method is called fresh

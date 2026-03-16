@@ -1,12 +1,13 @@
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TypeVar
 import json
 import pickle
 import numpy as np
 
-from .descriptors.base import Property, Display
+from .descriptors.base import Display, Field, FieldRestoreError
 from .descriptors.ports import InputPort, OutputPort
 from .descriptors.actions import Action
-from .descriptors.store import Store
+from .descriptors.state import State
 from .registry import get_connections_for_node
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -27,23 +28,23 @@ def background_init(func: F) -> F:
 
 
 class NodeMeta(type):
-    """Metaclass that collects inputs/outputs/properties/actions from class attributes."""
+    """Metaclass that collects inputs/outputs/fields/actions from class attributes."""
     
     def __new__(mcs, name, bases, namespace):
         # Start with inherited registries so subclasses can extend/override.
         _input_ports = {}
         _output_ports = {}
-        _properties = {}
+        _fields = {}
         _actions = {}
         _outputs = {}
-        _stores = {}
+        _states = {}
         for base in reversed(bases):
             _input_ports.update(getattr(base, "_input_ports", {}))
             _output_ports.update(getattr(base, "_output_ports", {}))
-            _properties.update(getattr(base, "_properties", {}))
+            _fields.update(getattr(base, "_fields", {}))
             _actions.update(getattr(base, "_actions", {}))
             _outputs.update(getattr(base, "_outputs", {}))
-            _stores.update(getattr(base, "_stores", {}))
+            _states.update(getattr(base, "_states", {}))
         
         # Scan namespace for descriptors
         for attr_name, attr_value in namespace.items():
@@ -55,14 +56,14 @@ class NodeMeta(type):
                 _input_ports[attr_name] = attr_value
             elif isinstance(attr_value, OutputPort):
                 _output_ports[attr_name] = attr_value
-            elif isinstance(attr_value, Property):
-                _properties[attr_name] = attr_value
+            elif isinstance(attr_value, Field):
+                _fields[attr_name] = attr_value
             elif isinstance(attr_value, Action):
                 _actions[attr_name] = attr_value
             elif isinstance(attr_value, Display):
                 _outputs[attr_name] = attr_value
-            elif isinstance(attr_value, Store):
-                _stores[attr_name] = attr_value
+            elif isinstance(attr_value, State):
+                _states[attr_name] = attr_value
         
         # Create the class
         cls = super().__new__(mcs, name, bases, namespace)
@@ -70,10 +71,10 @@ class NodeMeta(type):
         # Attach registries to the class
         cls._input_ports = _input_ports
         cls._output_ports = _output_ports
-        cls._properties = _properties
+        cls._fields = _fields
         cls._actions = _actions
         cls._outputs = _outputs
-        cls._stores = _stores
+        cls._states = _states
         init_fn = getattr(cls, "init", None)
         cls._uses_background_init = bool(
             callable(init_fn) and getattr(init_fn, "__background_init__", False)
@@ -87,7 +88,7 @@ class Node(metaclass=NodeMeta):
     Base class for all node types.
     
     InputPort and OutputPort values are accessed directly via self.{port_name}.
-    Property values are accessed directly via self.{property_name}.
+    Field values are accessed directly via self.{field_name}.
     Display values are accessed directly via self.{display_name}.
     
     Example:
@@ -95,7 +96,7 @@ class Node(metaclass=NodeMeta):
             input_data = InputPort("Input", np.ndarray)
             output_data = OutputPort("Output", np.ndarray)
             threshold = Slider("Threshold", 0.5, 0.0, 1.0)
-            result = Vector2D("Result")
+            result = Heatmap("Result")
             
             def process(self):
                 # Access inputs directly
@@ -184,13 +185,13 @@ class Node(metaclass=NodeMeta):
         input_ports = [p.to_spec() for p in getattr(self.__class__, "_input_ports", {}).values()]
         output_ports = [p.to_spec() for p in getattr(self.__class__, "_output_ports", {}).values()]
 
-        # Properties (editable controls in the node body)
-        properties = []
-        for name, prop in getattr(self.__class__, "_properties", {}).items():
+        # Fields (editable controls in the node body)
+        fields = []
+        for name, field in getattr(self.__class__, "_fields", {}).items():
             val = getattr(self, name)
-            spec = prop.to_spec(val)
+            spec = field.to_spec(val)
             spec["key"] = name
-            properties.append(spec)
+            fields.append(spec)
 
         # Actions (buttons)
         actions = []
@@ -203,17 +204,17 @@ class Node(metaclass=NodeMeta):
         outputs = []
         for name, display in getattr(self.__class__, "_outputs", {}).items():
             val = getattr(self, name)
-            spec = display.to_spec(val)
+            spec = display.to_spec(val, obj=self)
             spec["key"] = name
             spec["enabled"] = self._output_enabled.get(name, True)
             outputs.append(spec)
 
-        # Persisted stores (shown as informational metadata in the UI)
-        stores = []
-        for name, store in getattr(self.__class__, "_stores", {}).items():
-            spec = store.to_spec()
+        # Persisted state values (shown as informational metadata in the UI)
+        states = []
+        for name, state in getattr(self.__class__, "_states", {}).items():
+            spec = state.to_spec()
             spec["key"] = name
-            stores.append(spec)
+            states.append(spec)
 
         return {
             "node_type": self.node_type,
@@ -226,15 +227,16 @@ class Node(metaclass=NodeMeta):
             "category": getattr(self.__class__, "_node_branch", ""),
             "input_ports": input_ports,
             "output_ports": output_ports,
-            "properties": properties,
+            "fields": fields,
             "actions": actions,
             "outputs": outputs,
-            "stores": stores,
+            "states": states,
         }
 
     def to_dict(
         self,
         array_serializer: Optional[Callable[[np.ndarray], Any]] = None,
+        project_dir: Optional[Path] = None,
     ) -> dict:
         """
         Return a serializable representation of the node for persistence.
@@ -244,8 +246,8 @@ class Node(metaclass=NodeMeta):
             "type": self.node_type,
             "name": self.name,
             "position": self.position,
-            "properties": {},
-            "stores": {},
+            "fields": {},
+            "states": {},
         }
         
         def _serialize_value(val: Any) -> Any:
@@ -255,6 +257,8 @@ class Node(metaclass=NodeMeta):
                 return {"_type": "ndarray", "data": val.tolist()}
             if isinstance(val, np.generic):
                 return val.item()
+            if isinstance(val, Path):
+                return str(val)
             if isinstance(val, list):
                 return [_serialize_value(item) for item in val]
             if isinstance(val, tuple):
@@ -265,15 +269,16 @@ class Node(metaclass=NodeMeta):
                 return val
             return str(val)
 
-        # Save all property values
-        for prop_name in getattr(self.__class__, "_properties", {}).keys():
-            val = getattr(self, prop_name)
-            data["properties"][prop_name] = _serialize_value(val)
-        
-        # Save all store values
-        for store_name in getattr(self.__class__, "_stores", {}).keys():
-            val = getattr(self, store_name)
-            data["stores"][store_name] = _serialize_value(val)
+        # Save all field values
+        for field_name, descriptor in getattr(self.__class__, "_fields", {}).items():
+            val = getattr(self, field_name)
+            serialized = descriptor.serialize_value(val, project_dir=project_dir)
+            data["fields"][field_name] = _serialize_value(serialized)
+
+        # Save all state values
+        for state_name in getattr(self.__class__, "_states", {}).keys():
+            val = getattr(self, state_name)
+            data["states"][state_name] = _serialize_value(val)
                 
         return data
 
@@ -282,6 +287,7 @@ class Node(metaclass=NodeMeta):
         cls,
         data: dict,
         array_loader: Optional[Callable[[dict], Any]] = None,
+        project_dir: Optional[Path] = None,
     ) -> "Node":
         """
         Create a node instance from a dictionary representation.
@@ -305,20 +311,36 @@ class Node(metaclass=NodeMeta):
                 return {key: _deserialize_value(item) for key, item in val.items()}
             return val
 
-        # Restore property values
-        for prop_name, prop_val in data.get("properties", {}).items():
-            if hasattr(node, prop_name):
+        restore_errors = []
+
+        # Restore field values
+        for field_name, field_val in data.get("fields", {}).items():
+            descriptor = getattr(cls, "_fields", {}).get(field_name)
+            if not descriptor or not hasattr(node, field_name):
+                continue
+            try:
+                deserialized = _deserialize_value(field_val)
+                restored = descriptor.deserialize_value(deserialized, project_dir=project_dir)
+                setattr(node, field_name, restored)
+            except FieldRestoreError as e:
                 try:
-                    setattr(node, prop_name, _deserialize_value(prop_val))
-                except Exception as e:
-                    print(f"Error restoring property {prop_name}: {e}")
-        
-        # Restore store values
-        for store_name, store_val in data.get("stores", {}).items():
-            if hasattr(node, store_name):
+                    setattr(node, field_name, e.fallback_value)
+                except Exception:
+                    pass
+                restore_errors.append(str(e))
+                print(f"Error restoring field {field_name}: {e}")
+            except Exception as e:
+                restore_errors.append(f"{descriptor.label}: {e}")
+                print(f"Error restoring field {field_name}: {e}")
+
+        # Restore state values
+        for state_name, state_val in data.get("states", {}).items():
+            if hasattr(node, state_name):
                 try:
-                    setattr(node, store_name, _deserialize_value(store_val))
+                    setattr(node, state_name, _deserialize_value(state_val))
                 except Exception as e:
-                    print(f"Error restoring store {store_name}: {e}")
-                    
+                    print(f"Error restoring state {state_name}: {e}")
+        if restore_errors:
+            node._loading_error = "\n".join(restore_errors)
+
         return node

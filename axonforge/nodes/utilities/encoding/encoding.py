@@ -5,10 +5,10 @@ import os
 
 from ....core.node import Node
 from ....core.descriptors.ports import InputPort, OutputPort
-from ....core.descriptors.properties import Range, Integer
-from ....core.descriptors.displays import Vector2D, Vector1D, Text, Numeric, BarChart, LineChart
+from ....core.descriptors.fields import Range, Integer
+from ....core.descriptors.displays import Heatmap, Plot, Text, Numeric
 from ....core.descriptors.actions import Action
-from ....core.descriptors.store import Store
+from ....core.descriptors.state import State
 from ....core.descriptors import branch
 
 
@@ -31,7 +31,7 @@ class IntegerFeedbackEncoder(Node):
     max_value = Integer("Max Value", default=9)
     contrast = Range("Contrast", default=1.0, min_val=1.0, max_val=2.0, step=0.01)
 
-    vector1d = Vector1D("Vector", color_mode="binary")
+    plot = Plot("Vector", style="bar", color_positive="#d6e6ff", color_negative="#d6e6ff")
     info = Text("Info", default="No input")
 
     def process(self):
@@ -62,7 +62,7 @@ class IntegerFeedbackEncoder(Node):
                 output[idx] = c_val
 
         self.o_output = output
-        self.vector1d = output
+        self.plot = output
         self.info = f"Value: {val}, Active: {t_per_val}/{size}, Contrast: {c_val:.2f}"
 
 
@@ -73,7 +73,7 @@ class OneHotEncode(Node):
     o_encoding = OutputPort("Encoding", np.ndarray)
 
     input_length = Integer("Length", 10)
-    vector1d = Vector1D("Vector", "grayscale")
+    plot = Plot("Vector", style="bar", color_positive="#d6e6ff", color_negative="#d6e6ff")
     value = Text("Value")
 
     def init(self):
@@ -84,7 +84,7 @@ class OneHotEncode(Node):
         self.o_encoding = np.zeros((self.input_length))
         self.o_encoding[self.i_index] = 1
 
-        self.vector1d = self.o_encoding
+        self.plot = self.o_encoding
         self.value = self.i_index
 
 
@@ -116,7 +116,7 @@ class SparseIndexHashEncode(Node):
     max_value = Integer("Max Value", default=100)
 
     # Display the output vector
-    vector1d = Vector1D("Vector", color_mode="binary")
+    plot = Plot("Vector", style="bar", color_positive="#d6e6ff", color_negative="#d6e6ff")
 
     # Info text
     info = Text("Info", default="No input")
@@ -154,7 +154,7 @@ class SparseIndexHashEncode(Node):
         self.o_sparsity = sparsity_pct
         self.o_vector_size = size
         self.o_max_value = max_val
-        self.vector1d = output
+        self.plot = output
         self.info = f"Input: {input_val}, Size: {size}, Ones: {num_ones}, Sparsity: {sparsity_pct:.1f}%"
 
 
@@ -171,18 +171,18 @@ class SparseIndexHashDecode(Node):
     i_max_value = InputPort("Max Value", int)
 
     # Precompute button
-    precompute = Action("Precompute", callback="_on_precompute")
+    precompute = Action("Precompute", lambda self, params=None: self._on_precompute(params))
 
     # Info text
     info = Text("Info", default="Press Precompute")
 
-    # Store for the mapping dictionary
-    mapping = Store(default=None)
+    # State for the mapping dictionary
+    mapping = State(default=None)
 
-    # Store received parameters
-    _sparsity = Store(default=None)
-    _vector_size = Store(default=None)
-    _max_value = Store(default=None)
+    # State received parameters
+    _sparsity = State(default=None)
+    _vector_size = State(default=None)
+    _max_value = State(default=None)
 
     def _on_precompute(self, params: dict):
         """Create mapping from integers to binary vectors."""
@@ -216,7 +216,7 @@ class SparseIndexHashDecode(Node):
         return {"status": "ok", "message": f"Mapped {max_val + 1} values"}
 
     def process(self):
-        # Store received parameters from encoder
+        # State received parameters from encoder
         if self.i_sparsity is not None:
             self._sparsity = self.i_sparsity
         if self.i_vector_size is not None:
@@ -265,7 +265,7 @@ class UnitVectorHashEncode(Node):
     max_value = Integer("Max Value", default=100)
 
     # Display the output vector
-    barchart = BarChart("Vector", color="#e94560", show_negative=True, scale_mode="auto")
+    plot = Plot("Vector", style="bar", scale_mode="auto")
 
     # Info text
     info = Text("Info", default="No input")
@@ -297,7 +297,7 @@ class UnitVectorHashEncode(Node):
         self.o_output = output
         self.o_vector_size = size
         self.o_max_value = max_val
-        self.barchart = output
+        self.plot = output
         self.info = f"Input: {input_val}, Size: {size}, Norm: {np.linalg.norm(output):.6f}"
 
 
@@ -317,20 +317,20 @@ class UnitVectorHashDecode(Node):
     o_decoded = OutputPort("Decoded Value", int)
 
     # Precompute button
-    precompute = Action("Precompute", callback="_on_precompute")
+    precompute = Action("Precompute", lambda self, params=None: self._on_precompute(params))
 
     # Info text
     info = Text("Info", default="Press Precompute")
 
-    # Store for the mapping dictionary
-    mapping = Store(default=None)
+    # State for the mapping dictionary
+    mapping = State(default=None)
 
-    # Store received parameters
-    _vector_size = Store(default=None)
-    _max_value = Store(default=None)
+    # State received parameters
+    _vector_size = State(default=None)
+    _max_value = State(default=None)
 
-    # Store last decoded value
-    _last_decoded = Store(default=None)
+    # State last decoded value
+    _last_decoded = State(default=None)
 
     def _on_precompute(self, params: dict):
         """Create mapping from integers to unit vectors."""
@@ -359,7 +359,7 @@ class UnitVectorHashDecode(Node):
         return {"status": "ok", "message": f"Mapped {max_val + 1} values"}
 
     def process(self):
-        # Store received parameters from encoder
+        # State received parameters from encoder
         if self.i_vector_size is not None:
             self._vector_size = self.i_vector_size
         if self.i_max_value is not None:
@@ -426,19 +426,26 @@ class AccuracyTracker(Node):
     history_size = Integer("History Size", default=50)
 
     # Line chart to display accumulated average accuracies
-    linechart = LineChart("Accuracy History", color="#00f5ff", line_width=1.5, scale_mode="auto")
+    plot = Plot(
+        "Accuracy History",
+        style="line",
+        color_positive="#00f5ff",
+        color_negative="#00f5ff",
+        line_width=1.5,
+        scale_mode="auto",
+    )
 
     # Info display
     info = Text("Info", default="No data")
 
     # Reset button
-    reset = Action("Reset", callback="_on_reset")
+    reset = Action("Reset", lambda self, params=None: self._on_reset(params))
 
-    # Store for prediction history (1 = correct, 0 = incorrect)
-    _prediction_history = Store(default=None)
+    # State for prediction history (1 = correct, 0 = incorrect)
+    _prediction_history = State(default=None)
 
-    # Store for accuracy history (list of average accuracy values)
-    _accuracy_history = Store(default=None)
+    # State for accuracy history (list of average accuracy values)
+    _accuracy_history = State(default=None)
 
     def init(self):
         """Initialize history stores."""
@@ -450,7 +457,7 @@ class AccuracyTracker(Node):
         """Reset all history stores."""
         self._prediction_history = []
         self._accuracy_history = []
-        self.linechart = np.array([], dtype=np.float32)
+        self.plot = np.array([], dtype=np.float32)
         self.info = "Reset - No data"
         return {"status": "ok", "message": "History reset"}
 
@@ -495,7 +502,7 @@ class AccuracyTracker(Node):
         self._accuracy_history = acc_history
 
         # Update line chart with accuracy history
-        self.linechart = np.array(acc_history, dtype=np.float32)
+        self.plot = np.array(acc_history, dtype=np.float32)
 
         # Update info
         total_samples = len(pred_history)
@@ -517,16 +524,23 @@ class CosineTracker(Node):
     history_size = Integer("History Size", default=100)
 
     # Line chart to display cosine similarity history
-    linechart = LineChart("Cosine Similarity", color="#00f5ff", line_width=1.5, scale_mode="auto")
+    plot = Plot(
+        "Cosine Similarity",
+        style="line",
+        color_positive="#00f5ff",
+        color_negative="#00f5ff",
+        line_width=1.5,
+        scale_mode="auto",
+    )
 
     # Info display
     info = Text("Info", default="No data")
 
     # Reset button
-    reset = Action("Reset", callback="_on_reset")
+    reset = Action("Reset", lambda self, params=None: self._on_reset(params))
 
-    # Store for similarity history
-    _similarity_history = Store(default=None)
+    # State for similarity history
+    _similarity_history = State(default=None)
 
     def init(self):
         """Initialize history store."""
@@ -536,7 +550,7 @@ class CosineTracker(Node):
     def _on_reset(self, params: dict):
         """Reset similarity history."""
         self._similarity_history = []
-        self.linechart = np.array([], dtype=np.float32)
+        self.plot = np.array([], dtype=np.float32)
         self.info = "Reset - No data"
         return {"status": "ok", "message": "History reset"}
 
@@ -572,7 +586,7 @@ class CosineTracker(Node):
         self._similarity_history = sim_history
 
         # Update line chart with similarity history
-        self.linechart = np.array(sim_history, dtype=np.float32)
+        self.plot = np.array(sim_history, dtype=np.float32)
 
         # Update info
         total_history = len(sim_history)

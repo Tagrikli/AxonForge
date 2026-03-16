@@ -70,6 +70,11 @@ QLabel#workspace_label {
     padding: 0 2px;
 }
 
+QWidget#workspace_dirty_indicator {
+    background: #6f7d9d;
+    border-radius: 4px;
+}
+
 /* ─── Network Controls ───────────────────────────────────────────────────── */
 
 QPushButton#network_toggle {
@@ -497,4 +502,22 @@ QToolTip {
     color: #e6f1ff;
     font-size: 0.67em;
     padding: 3px 6px;
+}
+
+/* ─── Graph Panel (Right Drawer) ────────────────────────────────────────── */
+
+QWidget#graph_panel {
+    background: #0f1526;
+    border-left: 1px solid #26324d;
+}
+
+QWidget#graph_panel_header {
+    background: #0f1526;
+    border-bottom: 1px solid #26324d;
+}
+
+QLabel#graph_panel_title {
+    color: #8fa4ff;
+    font-size: 0.73em;
+    font-weight: 600;
 }

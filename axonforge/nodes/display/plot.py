@@ -1,27 +1,22 @@
-"""Plot node with history for MiniCortex."""
+"""Plot nodes with history for MiniCortex."""
 
 import numpy as np
 
 from ...core.node import Node
 from ...core.descriptors.ports import InputPort
-from ...core.descriptors.store import Store
-from ...core.descriptors.properties import Integer, Enum, Float
-from ...core.descriptors.displays import Vector1D, BarChart, LineChart, Text
+from ...core.descriptors.state import State
+from ...core.descriptors.fields import Integer, Enum, Float
+from ...core.descriptors.displays import Plot, Text
 from ...core.descriptors.actions import Action
 
 
 class PlotBar(Node):
-    """Plot numeric values in a history array using BarChart display.
-    
-    This node receives numeric inputs and maintains a history of values.
-    The history is displayed as a bar chart using BarChart with support for
-    negative values. The history is limited by the max_history property.
-    """
+    """Plot numeric values in a history array using bar style."""
 
     # Input port for numeric values
     input_value = InputPort("Input", (int, float))
     
-    # Property for maximum history length
+    # Field for maximum history length
     max_history = Integer("Max History", default=100)
     
     # Scale mode property - auto or manual
@@ -33,23 +28,23 @@ class PlotBar(Node):
     )
     
     # Manual scale range (used when scale_mode is "manual")
-    scale_min = Float("Min", default=0.0, on_change="_on_scale_values_changed")
-    scale_max = Float("Max", default=1.0, on_change="_on_scale_values_changed")
+    vmin = Float("V Min", default=0.0, on_change="_on_scale_values_changed")
+    vmax = Float("V Max", default=1.0, on_change="_on_scale_values_changed")
     
-    # Store for history - persists across sessions
-    history = Store("History", default=None)
+    # State for history - persists across sessions
+    history = State("History", default=None)
     
-    # Store for current count of valid elements
-    history_count = Store("History Count", default=0)
+    # State for current count of valid elements
+    history_count = State("History Count", default=0)
     
-    # Display for plotting the history as bar chart
-    plot = BarChart("Plot", color="#e94560", show_negative=True)
+    # Display for plotting the history as a signed bar plot
+    plot = Plot("Plot", style="bar", scale_mode="auto")
     
     # Display for min/max info
     info = Text("Info", default="min: —  max: —")
     
     # Action to reset the history
-    reset = Action("Reset", callback="_on_reset")
+    reset = Action("Reset", lambda self, params=None: self._on_reset(params))
 
     def _on_scale_changed(self, new_value, old_value):
         """Called when scale_mode property changes, updates the display config."""
@@ -64,17 +59,17 @@ class PlotBar(Node):
                     display_array = self.history.copy()
                 dmin = float(np.nanmin(display_array))
                 dmax = float(np.nanmax(display_array))
-                self.scale_min = dmin
-                self.scale_max = dmax
-            plot_descriptor.change_scale("manual", float(self.scale_min), float(self.scale_max), obj=self)
+                self.vmin = dmin
+                self.vmax = dmax
+            plot_descriptor.change_scale(self, "manual", float(self.vmin), float(self.vmax))
         else:
-            plot_descriptor.change_scale("auto", obj=self)
+            plot_descriptor.change_scale(self, "auto")
 
     def _on_scale_values_changed(self, new_value, old_value):
-        """Called when scale_min or scale_max changes, updates the display config."""
+        """Called when vmin or vmax changes, updates the display config."""
         if self.scale_mode == "manual":
             plot_descriptor = PlotBar.__dict__["plot"]
-            plot_descriptor.change_scale("manual", float(self.scale_min), float(self.scale_max), obj=self)
+            plot_descriptor.change_scale(self, "manual", float(self.vmin), float(self.vmax))
 
     def init(self):
         # Initialize history as numpy array if not already set
@@ -90,30 +85,17 @@ class PlotBar(Node):
             self.history_count = 0
 
     def _resize_history(self, new_size):
-        """Resize history array, shifting existing data to the right."""
+        """Resize history array while preserving the most recent valid samples."""
         old_size = len(self.history)
         new_history = np.full(new_size, np.nan, dtype=np.float32)
-        
-        # When increasing size: shift existing data to the END (right-aligned)
-        # When decreasing size: keep most recent data at the end
-        copy_count = min(old_size, new_size)
-        if new_size > old_size:
-            # Increase: put old data at the end
-            new_history[-copy_count:] = self.history[-copy_count:]
-        else:
-            # Decrease: keep the most recent data
-            new_history = self.history[-new_size:].copy()
-        
+
+        valid_count = int(max(0, min(int(self.history_count), old_size, new_size)))
+        if valid_count > 0:
+            valid_values = self.history[-valid_count:]
+            new_history[-valid_count:] = valid_values
+
         self.history = new_history
-        
-        # If increasing size and array was full, expand count to new size
-        # If decreasing size, cap count at new size
-        if new_size > old_size:
-            if self.history_count >= old_size:
-                self.history_count = new_size
-        else:
-            if self.history_count > new_size:
-                self.history_count = new_size
+        self.history_count = valid_count
 
     def process(self):
         max_len = int(self.max_history)
@@ -140,16 +122,15 @@ class PlotBar(Node):
         
         # Get the slice of valid data for display
         if self.history_count > 0:
-            # Get the last history_count elements
             if self.history_count < max_len:
-                display_array = self.history[-self.history_count:]
+                valid_values = self.history[-self.history_count:]
             else:
-                display_array = self.history.copy()
-            self.plot = display_array
+                valid_values = self.history.copy()
+            self.plot = valid_values
             
             # Calculate and display min/max
-            dmin = float(np.nanmin(display_array))
-            dmax = float(np.nanmax(display_array))
+            dmin = float(np.nanmin(valid_values))
+            dmax = float(np.nanmax(valid_values))
             self.info = f"min: {dmin:.2f}  max: {dmax:.2f}"
         else:
             # Empty plot when no history
@@ -167,17 +148,12 @@ class PlotBar(Node):
 
 
 class PlotLine(Node):
-    """Plot numeric values in a history array using LineChart display.
-    
-    This node receives numeric inputs and maintains a history of values.
-    The history is displayed as a line chart. The history is limited by
-    the max_history property.
-    """
+    """Plot numeric values in a history array using line style."""
 
     # Input port for numeric values
     input_value = InputPort("Input", (int, float))
     
-    # Property for maximum history length
+    # Field for maximum history length
     max_history = Integer("Max History", default=100)
     
     # Scale mode property - auto or manual
@@ -189,23 +165,30 @@ class PlotLine(Node):
     )
     
     # Manual scale range (used when scale_mode is "manual")
-    scale_min = Float("Min", default=0.0, on_change="_on_scale_values_changed")
-    scale_max = Float("Max", default=1.0, on_change="_on_scale_values_changed")
+    vmin = Float("V Min", default=0.0, on_change="_on_scale_values_changed")
+    vmax = Float("V Max", default=1.0, on_change="_on_scale_values_changed")
     
-    # Store for history - persists across sessions
-    history = Store("History", default=None)
+    # State for history - persists across sessions
+    history = State("History", default=None)
     
-    # Store for current count of valid elements
-    history_count = Store("History Count", default=0)
+    # State for current count of valid elements
+    history_count = State("History Count", default=0)
     
-    # Display for plotting the history as line chart
-    plot = LineChart("Plot", color="#00f5ff", line_width=0.7)
+    # Display for plotting the history as a line plot
+    plot = Plot(
+        "Plot",
+        style="line",
+        color_positive="#00f5ff",
+        color_negative="#00f5ff",
+        line_width=0.7,
+        scale_mode="auto",
+    )
     
     # Display for min/max info
     info = Text("Info", default="min: —  max: —")
     
     # Action to reset the history
-    reset = Action("Reset", callback="_on_reset")
+    reset = Action("Reset", lambda self, params=None: self._on_reset(params))
 
     def _on_scale_changed(self, new_value, old_value):
         """Called when scale_mode property changes, updates the display config."""
@@ -220,17 +203,17 @@ class PlotLine(Node):
                     display_array = self.history.copy()
                 dmin = float(np.nanmin(display_array))
                 dmax = float(np.nanmax(display_array))
-                self.scale_min = dmin
-                self.scale_max = dmax
-            plot_descriptor.change_scale("manual", float(self.scale_min), float(self.scale_max), obj=self)
+                self.vmin = dmin
+                self.vmax = dmax
+            plot_descriptor.change_scale(self, "manual", float(self.vmin), float(self.vmax))
         else:
-            plot_descriptor.change_scale("auto", obj=self)
+            plot_descriptor.change_scale(self, "auto")
 
     def _on_scale_values_changed(self, new_value, old_value):
-        """Called when scale_min or scale_max changes, updates the display config."""
+        """Called when vmin or vmax changes, updates the display config."""
         if self.scale_mode == "manual":
             plot_descriptor = PlotLine.__dict__["plot"]
-            plot_descriptor.change_scale("manual", float(self.scale_min), float(self.scale_max), obj=self)
+            plot_descriptor.change_scale(self, "manual", float(self.vmin), float(self.vmax))
 
     def init(self):
         # Initialize history as numpy array if not already set
@@ -246,30 +229,17 @@ class PlotLine(Node):
             self.history_count = 0
 
     def _resize_history(self, new_size):
-        """Resize history array, shifting existing data to the right."""
+        """Resize history array while preserving the most recent valid samples."""
         old_size = len(self.history)
         new_history = np.full(new_size, np.nan, dtype=np.float32)
-        
-        # When increasing size: shift existing data to the END (right-aligned)
-        # When decreasing size: keep most recent data at the end
-        copy_count = min(old_size, new_size)
-        if new_size > old_size:
-            # Increase: put old data at the end
-            new_history[-copy_count:] = self.history[-copy_count:]
-        else:
-            # Decrease: keep the most recent data
-            new_history = self.history[-new_size:].copy()
-        
+
+        valid_count = int(max(0, min(int(self.history_count), old_size, new_size)))
+        if valid_count > 0:
+            valid_values = self.history[-valid_count:]
+            new_history[-valid_count:] = valid_values
+
         self.history = new_history
-        
-        # If increasing size and array was full, expand count to new size
-        # If decreasing size, cap count at new size
-        if new_size > old_size:
-            if self.history_count >= old_size:
-                self.history_count = new_size
-        else:
-            if self.history_count > new_size:
-                self.history_count = new_size
+        self.history_count = valid_count
 
     def process(self):
         max_len = int(self.max_history)
@@ -296,16 +266,15 @@ class PlotLine(Node):
         
         # Get the slice of valid data for display
         if self.history_count > 0:
-            # Get the last history_count elements
             if self.history_count < max_len:
-                display_array = self.history[-self.history_count:]
+                valid_values = self.history[-self.history_count:]
             else:
-                display_array = self.history.copy()
-            self.plot = display_array
+                valid_values = self.history.copy()
+            self.plot = valid_values
             
             # Calculate and display min/max
-            dmin = float(np.nanmin(display_array))
-            dmax = float(np.nanmax(display_array))
+            dmin = float(np.nanmin(valid_values))
+            dmax = float(np.nanmax(valid_values))
             self.info = f"min: {dmin:.2f}  max: {dmax:.2f}"
         else:
             # Empty plot when no history

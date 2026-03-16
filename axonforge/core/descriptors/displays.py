@@ -1,13 +1,18 @@
 from typing import Any, Callable, Optional, Union
+
+import numpy as np
+
 from .base import Display
+
 
 class Numeric(Display):
     """Scalar output display descriptor."""
+
     def __init__(self, label: str, format: str = ".4f"):
         super().__init__(label, 0.0)
         self.format = format
 
-    def to_spec(self, value: Any = None) -> dict:
+    def to_spec(self, value: Any = None, obj: Any = None) -> dict:
         formatted = f"{value:{self.format}}" if isinstance(value, (int, float)) else str(value)
         return {
             "type": "numeric",
@@ -18,175 +23,186 @@ class Numeric(Display):
         }
 
 
-class Vector1D(Display):
-    """1D array visualization descriptor."""
-    def __init__(self, label: str, color_mode: str = "grayscale"):
-        super().__init__(label)
-        self.color_mode = color_mode
+class Plot(Display):
+    """1D quantitative plot descriptor."""
 
-    def to_spec(self, value: Any = None) -> dict:
-        return {
-            "type": "vector1d",
-            "label": self.label,
-            "color_mode": self.color_mode,
-            "shape": list(value.shape) if value is not None and hasattr(value, "shape") else None,
-        }
-
-
-class BarChart(Display):
-    """1D array bar chart visualization descriptor."""
     def __init__(
         self,
         label: str,
-        color: str = "#e94560",
-        show_negative: bool = True,
+        style: str = "line",
+        color_positive: Optional[str] = None,
+        color_negative: Optional[str] = None,
         scale_mode: str = "auto",
-        scale_min: float = 0.0,
-        scale_max: float = 1.0,
-    ):
-        super().__init__(label)
-        self.color = color
-        self.show_negative = show_negative
-        self.scale_mode = scale_mode
-        self.scale_min = scale_min
-        self.scale_max = scale_max
-
-    def change_scale(self, scale_mode: str, scale_min: Optional[float] = None, scale_max: Optional[float] = None, obj: Any = None) -> None:
-        """Change scale settings at runtime and notify the UI.
-        
-        Args:
-            scale_mode: The new scale mode ("auto" or "manual")
-            scale_min: The minimum value for manual scaling (optional)
-            scale_max: The maximum value for manual scaling (optional)
-            obj: The node instance to pass to the on_change callback (optional)
-        """
-        old_config = {
-            "scale_mode": self.scale_mode,
-            "scale_min": self.scale_min,
-            "scale_max": self.scale_max,
-        }
-        self.scale_mode = scale_mode
-        if scale_min is not None:
-            self.scale_min = scale_min
-        if scale_max is not None:
-            self.scale_max = scale_max
-        # Trigger on_change callback if configured
-        if self.on_change and obj is not None:
-            self._trigger_change(obj, {
-                "scale_mode": self.scale_mode,
-                "scale_min": self.scale_min,
-                "scale_max": self.scale_max,
-            }, old_config)
-
-    def to_spec(self, value: Any = None) -> dict:
-        return {
-            "type": "barchart",
-            "label": self.label,
-            "color": self.color,
-            "show_negative": self.show_negative,
-            "scale_mode": self.scale_mode,
-            "scale_min": self.scale_min,
-            "scale_max": self.scale_max,
-            "shape": list(value.shape) if value is not None and hasattr(value, "shape") else None,
-        }
-
-
-class LineChart(Display):
-    """1D array line chart visualization descriptor."""
-    def __init__(
-        self,
-        label: str,
-        color: str = "#00f5ff",
+        vmin: float = 0.0,
+        vmax: float = 1.0,
         line_width: float = 1.5,
-        scale_mode: str = "auto",
-        scale_min: float = 0.0,
-        scale_max: float = 1.0,
     ):
         super().__init__(label)
-        self.color = color
-        self.line_width = line_width
-        self.scale_mode = scale_mode
-        self.scale_min = scale_min
-        self.scale_max = scale_max
+        self.color_positive = color_positive or "#3dff6f"
+        self.color_negative = color_negative or "#e94560"
+        self._default_style = style
+        self._default_scale_mode = scale_mode
+        self._default_vmin = float(vmin)
+        self._default_vmax = float(vmax)
+        self._default_line_width = float(line_width)
 
-    def change_scale(self, scale_mode: str, scale_min: Optional[float] = None, scale_max: Optional[float] = None, obj: Any = None) -> None:
-        """Change scale settings at runtime and notify the UI.
-        
-        Args:
-            scale_mode: The new scale mode ("auto" or "manual")
-            scale_min: The minimum value for manual scaling (optional)
-            scale_max: The maximum value for manual scaling (optional)
-            obj: The node instance to pass to the on_change callback (optional)
-        """
-        old_config = {
-            "scale_mode": self.scale_mode,
-            "scale_min": self.scale_min,
-            "scale_max": self.scale_max,
-        }
-        self.scale_mode = scale_mode
-        if scale_min is not None:
-            self.scale_min = scale_min
-        if scale_max is not None:
-            self.scale_max = scale_max
-        # Trigger on_change callback if configured
-        if self.on_change and obj is not None:
-            self._trigger_change(obj, {
-                "scale_mode": self.scale_mode,
-                "scale_min": self.scale_min,
-                "scale_max": self.scale_max,
-            }, old_config)
+    def __set__(self, obj, value: Any) -> None:
+        if value is not None:
+            array = np.asarray(value)
+            if array.ndim not in (1, 2):
+                raise ValueError(
+                    f"{self.name} expects a 1D or 2D array, got shape {array.shape}"
+                )
+        super().__set__(obj, value)
 
-    def to_spec(self, value: Any = None) -> dict:
+    def default_config(self) -> dict:
         return {
-            "type": "linechart",
+            "style": self._default_style,
+            "scale_mode": self._default_scale_mode,
+            "vmin": self._default_vmin,
+            "vmax": self._default_vmax,
+            "line_width": self._default_line_width,
+        }
+
+    def change_style(
+        self,
+        obj: Any,
+        style: str,
+        line_width: Optional[float] = None,
+    ) -> dict:
+        config = {"style": str(style)}
+        if line_width is not None:
+            config["line_width"] = float(line_width)
+        return self.set_config(obj, config)
+
+    def change_scale(
+        self,
+        obj: Any,
+        scale_mode: str,
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+    ) -> dict:
+        config = {"scale_mode": str(scale_mode)}
+        if vmin is not None:
+            config["vmin"] = float(vmin)
+        if vmax is not None:
+            config["vmax"] = float(vmax)
+        return self.set_config(obj, config)
+
+    def to_spec(self, value: Any = None, obj: Any = None) -> dict:
+        config = self.get_config(obj) if obj is not None else self.default_config()
+        return {
+            "type": "plot",
             "label": self.label,
-            "color": self.color,
-            "line_width": self.line_width,
-            "scale_mode": self.scale_mode,
-            "scale_min": self.scale_min,
-            "scale_max": self.scale_max,
+            "style": config["style"],
+            "scale_mode": config["scale_mode"],
+            "vmin": config["vmin"],
+            "vmax": config["vmax"],
+            "line_width": config["line_width"],
+            "color_positive": self.color_positive,
+            "color_negative": self.color_negative,
             "shape": list(value.shape) if value is not None and hasattr(value, "shape") else None,
         }
 
 
-class Vector2D(Display):
-    """2D array visualization descriptor."""
-    def __init__(self, label: str, color_mode: str = "grayscale", on_change: Union[str, Callable, None] = None):
+class Heatmap(Display):
+    """2D scalar-field visualization descriptor."""
+
+    def __init__(
+        self,
+        label: str,
+        colormap: str = "grayscale",
+        scale_mode: str = "auto",
+        vmin: float = 0.0,
+        vmax: float = 1.0,
+        on_change: Union[str, Callable, None] = None,
+    ):
         super().__init__(label, on_change=on_change)
-        self.color_mode = color_mode
+        self._default_colormap = colormap
+        self._default_scale_mode = scale_mode
+        self._default_vmin = float(vmin)
+        self._default_vmax = float(vmax)
 
-    def change_color_mode(self, new_mode: str, obj: Any = None) -> None:
-        """Change color mode at runtime and notify the UI.
-        
-        Args:
-            new_mode: The new color mode (e.g., "grayscale", "bwr", "rgb")
-            obj: The node instance to pass to the on_change callback (optional, for auto-notification)
-        """
-        old_mode = self.color_mode
-        if new_mode != old_mode:
-            self.color_mode = new_mode
-            # Trigger on_change callback if configured
-            if self.on_change and obj is not None:
-                self._trigger_change(obj, {"color_mode": new_mode}, {"color_mode": old_mode})
-
-    def to_spec(self, value: Any = None) -> dict:
+    def default_config(self) -> dict:
         return {
-            "type": "vector2d",
+            "colormap": self._default_colormap,
+            "scale_mode": self._default_scale_mode,
+            "vmin": self._default_vmin,
+            "vmax": self._default_vmax,
+        }
+
+    def __set__(self, obj, value: Any) -> None:
+        if value is not None:
+            array = np.asarray(value)
+            if array.ndim not in (1, 2):
+                raise ValueError(
+                    f"{self.name} expects a 1D or 2D array, got shape {array.shape}"
+                )
+        super().__set__(obj, value)
+
+    def change_colormap(self, obj: Any, new_colormap: str) -> dict:
+        return self.set_config(obj, {"colormap": new_colormap})
+
+    def change_scale(
+        self,
+        obj: Any,
+        scale_mode: str,
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+    ) -> dict:
+        config = {"scale_mode": scale_mode}
+        if vmin is not None:
+            config["vmin"] = float(vmin)
+        if vmax is not None:
+            config["vmax"] = float(vmax)
+        return self.set_config(obj, config)
+
+    def to_spec(self, value: Any = None, obj: Any = None) -> dict:
+        config = self.get_config(obj) if obj is not None else self.default_config()
+        return {
+            "type": "heatmap",
             "label": self.label,
-            "color_mode": self.color_mode,
+            "colormap": config["colormap"],
+            "scale_mode": config["scale_mode"],
+            "vmin": config["vmin"],
+            "vmax": config["vmax"],
+            "shape": list(value.shape) if value is not None and hasattr(value, "shape") else None,
+        }
+
+
+class Image(Display):
+    """2D grayscale or 3/4-channel image visualization descriptor."""
+
+    def __set__(self, obj, value: Any) -> None:
+        if value is not None:
+            array = np.asarray(value)
+            valid = array.ndim == 2 or (array.ndim == 3 and array.shape[2] in (3, 4))
+            if not valid:
+                raise ValueError(
+                    f"{self.name} expects a 2D image or HxWx3/4 image, got shape {array.shape}"
+                )
+        super().__set__(obj, value)
+
+    def to_spec(self, value: Any = None, obj: Any = None) -> dict:
+        return {
+            "type": "image",
+            "label": self.label,
             "shape": list(value.shape) if value is not None and hasattr(value, "shape") else None,
         }
 
 
 class Text(Display):
     """Text output display descriptor."""
-    def __init__(self, label: str, default: str = ""):
-        super().__init__(label, default)
 
-    def to_spec(self, value: Any = None) -> dict:
+    def __init__(self, label: str, default: str = "", max_height: float = 140.0):
+        super().__init__(label, default)
+        self.max_height = float(max_height)
+
+    def to_spec(self, value: Any = None, obj: Any = None) -> dict:
         return {
             "type": "text",
             "label": self.label,
             "default": self.default,
+            "max_height": self.max_height,
             "value": value or self.default,
         }

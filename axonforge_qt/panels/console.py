@@ -8,7 +8,7 @@ Features:
 - Auto-scroll to bottom
 - 1000 lines maximum limit
 - Error messages shown in red
-- Toggle visibility with Shift+T shortcut
+- Toggle visibility with Shift+W shortcut
 """
 
 from __future__ import annotations

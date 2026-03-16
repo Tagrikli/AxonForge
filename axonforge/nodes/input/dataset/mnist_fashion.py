@@ -2,10 +2,10 @@ import numpy as np
 
 from ....core.node import Node, background_init
 from ....core.descriptors.ports import InputPort, OutputPort
-from ....core.descriptors.displays import Vector2D, Text
-from ....core.descriptors.store import Store
+from ....core.descriptors.displays import Heatmap, Text
+from ....core.descriptors.state import State
 from ....core.descriptors import branch
-from ....nodes.utilities import _load_dataset_with_python_mnist
+from ....nodes.utilities.dataset_cache import load_dataset_with_python_mnist
 
 
 class InputFashionMNIST(Node):
@@ -13,11 +13,11 @@ class InputFashionMNIST(Node):
 
     output_pattern = OutputPort("Pattern", np.ndarray)
     output_category = OutputPort("Category", int)
-    pattern = Vector2D("Pattern", color_mode="grayscale")
+    pattern = Heatmap("Pattern", colormap="grayscale")
     info = Text("Info", default="Fashion: 0")
     
-    # Store: current image index
-    idx = Store(default=0)
+    # State: current image index
+    idx = State(default=0)
     
     LABEL_NAMES = [
         "T-shirt/top",
@@ -34,7 +34,7 @@ class InputFashionMNIST(Node):
 
     @background_init
     def init(self):
-        self._images, self._labels = _load_dataset_with_python_mnist("fashion_mnist")
+        self._images, self._labels = load_dataset_with_python_mnist("fashion_mnist")
         self._update_pattern()
 
     def process(self):
