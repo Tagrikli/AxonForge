@@ -173,8 +173,7 @@ The app launches scoped to the current directory. It discovers both built-in nod
 | `Shift+D` | Duplicate selected node(s) |
 | `Shift+Q` | Toggle node palette drawer |
 | `Shift+W` | Toggle console |
-| Right-click node | Delete node |
-| Right-click connection | Delete connection |
+| `Shift+X` | Delete selected node(s) or the hovered connection |
 | Mouse wheel | Zoom |
 | Middle mouse drag | Pan |
 
