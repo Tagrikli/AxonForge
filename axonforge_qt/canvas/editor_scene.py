@@ -56,6 +56,7 @@ class EditorScene(QGraphicsScene):
         item.signals.name_change_requested.connect(self._on_name_change_requested)
         item.signals.field_changed.connect(self._on_field_changed)
         item.signals.action_triggered.connect(self._on_action_triggered)
+        item.signals.display_event.connect(self._on_display_event)
         item.signals.reload_requested.connect(self._on_reload_requested)
         if bring_to_front:
             self.bring_node_to_front(item)
@@ -540,6 +541,17 @@ class EditorScene(QGraphicsScene):
             self.bridge.execute_action(node_id, action_key)
         except Exception as e:
             print(f"Action failed: {e}")
+
+    def _on_display_event(
+        self, node_id: str, display_key: str, event_type: str,
+        row: int, col: int, button: str, delta: int,
+    ) -> None:
+        try:
+            self.bridge.handle_display_event(
+                node_id, display_key, event_type, row, col, button, delta,
+            )
+        except Exception as e:
+            print(f"Display event failed: {e}")
 
     def _on_reload_requested(self, node_id: str) -> None:
         def _do_reload() -> None:

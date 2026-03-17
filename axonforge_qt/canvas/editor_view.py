@@ -129,12 +129,11 @@ class EditorView(QGraphicsView):
                         super().wheelEvent(event)
                         return
             if isinstance(top_item, NodeItem):
-                # Check if mouse is over a plot display on this node
                 scene_pos = self.mapToScene(event.position().toPoint())
                 local_pos = top_item.mapFromScene(scene_pos)
-                plot_key = top_item._find_plot_key_at(local_pos)
-                if plot_key is not None:
-                    # Let the scene deliver the event to the node item
+                # Check if mouse is over an interactive heatmap or plot display
+                if (top_item._find_interactive_heatmap_at(local_pos) is not None
+                        or top_item._find_plot_key_at(local_pos) is not None):
                     super().wheelEvent(event)
                     return
             top_item = top_item.parentItem()

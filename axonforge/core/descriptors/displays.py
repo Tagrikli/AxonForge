@@ -106,7 +106,14 @@ class Plot(Display):
 
 
 class Heatmap(Display):
-    """2D scalar-field visualization descriptor."""
+    """2D scalar-field visualization descriptor.
+
+    Interactive callbacks (all optional, receive grid cell coordinates):
+        on_press(row, col, button)   — mouse button down ("left" or "right")
+        on_move(row, col, button)    — drag to new cell while button held
+        on_release(row, col, button) — mouse button released
+        on_scroll(row, col, delta)   — wheel scroll, delta is +1 or -1
+    """
 
     def __init__(
         self,
@@ -116,12 +123,48 @@ class Heatmap(Display):
         vmin: float = 0.0,
         vmax: float = 1.0,
         on_change: Union[str, Callable, None] = None,
+        on_press: Union[str, Callable, None] = None,
+        on_move: Union[str, Callable, None] = None,
+        on_release: Union[str, Callable, None] = None,
+        on_scroll: Union[str, Callable, None] = None,
     ):
         super().__init__(label, on_change=on_change)
         self._default_colormap = colormap
         self._default_scale_mode = scale_mode
         self._default_vmin = float(vmin)
         self._default_vmax = float(vmax)
+        self.on_press = on_press
+        self.on_move = on_move
+        self.on_release = on_release
+        self.on_scroll = on_scroll
+
+    @property
+    def interactive(self) -> bool:
+        return any([self.on_press, self.on_move, self.on_release, self.on_scroll])
+
+    def _invoke(self, obj: Any, callback_name: str, *args) -> None:
+        """Invoke a named callback on the node."""
+        cb = getattr(self, callback_name, None)
+        if cb is None:
+            return
+        if isinstance(cb, str):
+            method = getattr(obj, cb, None)
+            if callable(method):
+                method(*args)
+        elif callable(cb):
+            cb(obj, *args)
+
+    def handle_press(self, obj: Any, row: int, col: int, button: str) -> None:
+        self._invoke(obj, "on_press", row, col, button)
+
+    def handle_move(self, obj: Any, row: int, col: int, button: str) -> None:
+        self._invoke(obj, "on_move", row, col, button)
+
+    def handle_release(self, obj: Any, row: int, col: int, button: str) -> None:
+        self._invoke(obj, "on_release", row, col, button)
+
+    def handle_scroll(self, obj: Any, row: int, col: int, delta: int) -> None:
+        self._invoke(obj, "on_scroll", row, col, delta)
 
     def default_config(self) -> dict:
         return {
@@ -159,7 +202,7 @@ class Heatmap(Display):
 
     def to_spec(self, value: Any = None, obj: Any = None) -> dict:
         config = self.get_config(obj) if obj is not None else self.default_config()
-        return {
+        spec = {
             "type": "heatmap",
             "label": self.label,
             "colormap": config["colormap"],
@@ -168,6 +211,9 @@ class Heatmap(Display):
             "vmax": config["vmax"],
             "shape": list(value.shape) if value is not None and hasattr(value, "shape") else None,
         }
+        if self.interactive:
+            spec["interactive"] = True
+        return spec
 
 
 class Image(Display):

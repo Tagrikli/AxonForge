@@ -407,6 +407,34 @@ class BridgeAPI:
         self.snapshot_displays()
         return result
 
+    def handle_display_event(
+        self, node_id: str, display_key: str,
+        event_type: str, row: int, col: int,
+        button: str = "", delta: int = 0,
+    ) -> None:
+        node = get_node(node_id)
+        if not node:
+            return
+        descriptor = getattr(node.__class__, "_outputs", {}).get(display_key)
+        if descriptor is None:
+            return
+        handler = getattr(descriptor, f"handle_{event_type}", None)
+        if handler is None:
+            return
+        if event_type == "scroll":
+            handler(node, row, col, delta)
+        else:
+            handler(node, row, col, button)
+        if self.network and not self.network.running:
+            try:
+                self.network.propagate_from_node(node_id, recompute_start=True)
+            except NetworkError as e:
+                print(f"Display event error in '{node_id}.{display_key}': {e}")
+                if e.traceback:
+                    print(e.traceback)
+        self.mark_current_graph_dirty()
+        self.snapshot_displays()
+
     def set_output_enabled(self, node_id: str, output_key: str, enabled: bool) -> None:
         node = get_node(node_id)
         if not node:

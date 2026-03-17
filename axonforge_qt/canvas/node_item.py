@@ -109,6 +109,7 @@ class _NodeSignals(QObject):
     name_change_requested = Signal(str, str)      # node_id, new_name
     field_changed = Signal(str, str, object)   # node_id, field_key, value
     action_triggered = Signal(str, str)            # node_id, action_key
+    display_event = Signal(str, str, str, int, int, str, int)  # node_id, key, event_type, row, col, button, delta
     reload_requested = Signal(str)                 # node_id
 
 
@@ -205,6 +206,9 @@ class NodeItem(QGraphicsItem):
         self._plot_view_state: Dict[str, dict] = {}
         self._plot_drag_key: Optional[str] = None
         self._plot_drag_last_pos: Optional[QPointF] = None
+        # Interactive heatmap touch state
+        self._heatmap_touch_key: Optional[str] = None
+        self._heatmap_touch_button: str = ""
         self._error_partition_rect: Optional[QRectF] = None
         self._state_hint_rect: Optional[QRectF] = None
         self._state_hint_text: str = ""
@@ -1644,6 +1648,41 @@ class NodeItem(QGraphicsItem):
                 dmax = dmin + 1.0
             return {"ymin": dmin, "ymax": dmax}
 
+    # ── Interactive heatmap helpers ────────────────────────────────────────
+
+    def _find_interactive_heatmap_at(self, pos: QPointF) -> Optional[str]:
+        """Find which interactive heatmap display contains the given position."""
+        for output in self.schema.get("outputs", []):
+            if output.get("type") != "heatmap" or not output.get("interactive"):
+                continue
+            key = output.get("key", "")
+            rect = self._display_rects.get(key)
+            if rect and rect.contains(pos):
+                return key
+        return None
+
+    def _heatmap_cell_at(self, key: str, pos: QPointF) -> Optional[tuple]:
+        """Map a position to (row, col) grid cell for a heatmap display."""
+        rect = self._display_rects.get(key)
+        if rect is None:
+            return None
+        data = self._display_cache.get(key)
+        if data is None or not hasattr(data, "shape"):
+            return None
+        if data.ndim == 2:
+            rows, cols = data.shape
+        elif data.ndim == 1:
+            rows, cols = 1, data.shape[0]
+        else:
+            return None
+        if rows == 0 or cols == 0:
+            return None
+        col = int((pos.x() - rect.x()) / rect.width() * cols)
+        row = int((pos.y() - rect.y()) / rect.height() * rows)
+        col = max(0, min(cols - 1, col))
+        row = max(0, min(rows - 1, row))
+        return (row, col)
+
     def _paint_plot(self, painter: QPainter, rect: QRectF, key: str, spec: dict) -> None:
         """Paint a 1D plot with grid, axis ticks, and value labels."""
         data = self._display_cache.get(key)
@@ -2349,6 +2388,21 @@ class NodeItem(QGraphicsItem):
 
         pos = event.pos()
 
+        # Left/right click on interactive heatmap: start press+drag
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            hm_key = self._find_interactive_heatmap_at(pos)
+            if hm_key is not None:
+                btn = "left" if event.button() == Qt.MouseButton.LeftButton else "right"
+                self._heatmap_touch_key = hm_key
+                self._heatmap_touch_button = btn
+                cell = self._heatmap_cell_at(hm_key, pos)
+                if cell is not None:
+                    self.signals.display_event.emit(
+                        self.node_id, hm_key, "press", cell[0], cell[1], btn, 0,
+                    )
+                event.accept()
+                return
+
         # Right-click on plot: start pan drag
         if event.button() == Qt.MouseButton.RightButton:
             plot_key = self._find_plot_key_at(pos)
@@ -2378,7 +2432,17 @@ class NodeItem(QGraphicsItem):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        """Handle plot pan drag."""
+        """Handle plot pan drag and heatmap touch drag."""
+        if self._heatmap_touch_key is not None:
+            key = self._heatmap_touch_key
+            cell = self._heatmap_cell_at(key, event.pos())
+            if cell is not None:
+                self.signals.display_event.emit(
+                    self.node_id, key, "move", cell[0], cell[1],
+                    self._heatmap_touch_button, 0,
+                )
+            event.accept()
+            return
         if self._plot_drag_key is not None:
             key = self._plot_drag_key
             view = self._plot_view_state.get(key)
@@ -2412,7 +2476,20 @@ class NodeItem(QGraphicsItem):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        """End plot pan drag."""
+        """End plot pan drag or heatmap touch."""
+        if self._heatmap_touch_key is not None:
+            released_btn = "left" if event.button() == Qt.MouseButton.LeftButton else "right"
+            if released_btn == self._heatmap_touch_button:
+                cell = self._heatmap_cell_at(self._heatmap_touch_key, event.pos())
+                if cell is not None:
+                    self.signals.display_event.emit(
+                        self.node_id, self._heatmap_touch_key, "release",
+                        cell[0], cell[1], self._heatmap_touch_button, 0,
+                    )
+                self._heatmap_touch_key = None
+                self._heatmap_touch_button = ""
+                event.accept()
+                return
         if self._plot_drag_key is not None and event.button() == Qt.MouseButton.RightButton:
             self._plot_drag_key = None
             self._plot_drag_last_pos = None
@@ -2421,7 +2498,20 @@ class NodeItem(QGraphicsItem):
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QGraphicsSceneWheelEvent) -> None:
-        """Zoom plot on scroll: 1D for line/bar, 2D for scatter."""
+        """Scroll on interactive heatmap or zoom plot."""
+        # Scroll on interactive heatmap
+        hm_key = self._find_interactive_heatmap_at(event.pos())
+        if hm_key is not None:
+            cell = self._heatmap_cell_at(hm_key, event.pos())
+            if cell is not None:
+                delta = 1 if event.delta() > 0 else -1
+                self.signals.display_event.emit(
+                    self.node_id, hm_key, "scroll", cell[0], cell[1], "", delta,
+                )
+            event.accept()
+            return
+
+        # Scroll on plot: zoom
         plot_key = self._find_plot_key_at(event.pos())
         if plot_key is None:
             super().wheelEvent(event)
