@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox, QPushButton, QLineEdit,
     QPlainTextEdit,
     QFileDialog, QHBoxLayout, QVBoxLayout, QLabel, QSizePolicy, QToolTip, QMenu,
-    QStyleOptionGraphicsItem, QGraphicsSceneMouseEvent, QProxyStyle, QStyle,
+    QStyleOptionGraphicsItem, QGraphicsSceneMouseEvent, QGraphicsSceneWheelEvent, QProxyStyle, QStyle,
 )
 
 from .port_item import PortItem, PortHitZoneItem
@@ -63,10 +63,10 @@ LOADING_TEXT = QColor("#d6e6ff")
 HEADER_HEIGHT = 22.0
 PORT_ROW_HEIGHT = 18.0
 NODE_MIN_WIDTH = 250.0
-PLOT_NODE_MIN_WIDTH = 340.0
+PLOT_NODE_MIN_WIDTH = 420.0
 PADDING = 6.0
 MAX_DISPLAY_DIM = 512
-PLOT_DISPLAY_HEIGHT = 130.0
+PLOT_DISPLAY_HEIGHT = 180.0
 FONT_FAMILY = "Roboto"
 MONO_FAMILY = "Roboto Mono"
 
@@ -199,6 +199,10 @@ class NodeItem(QGraphicsItem):
         self._height = 0.0
         self._body_y = 0.0
         self._display_rects: Dict[str, QRectF] = {}
+        # Plot pan/zoom view state: {key: {"ymin","ymax"} or {"xmin","xmax","ymin","ymax"}}
+        self._plot_view_state: Dict[str, dict] = {}
+        self._plot_drag_key: Optional[str] = None
+        self._plot_drag_last_pos: Optional[QPointF] = None
         self._error_partition_rect: Optional[QRectF] = None
         self._state_hint_rect: Optional[QRectF] = None
         self._state_hint_text: str = ""
@@ -1556,6 +1560,72 @@ class NodeItem(QGraphicsItem):
         painter.drawImage(rect, img)
         painter.restore()
 
+    # ── Plot pan/zoom helpers ─────────────────────────────────────────────
+
+    def _plot_rect_for_display(self, key: str) -> Optional[QRectF]:
+        """Compute the inner plot area from the display rect."""
+        rect = self._display_rects.get(key)
+        if rect is None:
+            return None
+        return QRectF(
+            rect.x() + 30.0,        # y_label_w
+            rect.y() + 12.0,        # top_pad
+            rect.width() - 30.0 - 2,
+            rect.height() - 12.0 - 10.0,  # top_pad + x_label_h
+        )
+
+    def _find_plot_key_at(self, pos: QPointF) -> Optional[str]:
+        """Find which plot display contains the given position."""
+        for output in self.schema.get("outputs", []):
+            if output.get("type") != "plot":
+                continue
+            key = output.get("key", "")
+            rect = self._display_rects.get(key)
+            if rect and rect.contains(pos):
+                return key
+        return None
+
+    def _get_plot_style(self, key: str) -> str:
+        """Get the plot style for a display key."""
+        config = self._display_config.get(key, {})
+        for output in self.schema.get("outputs", []):
+            if output.get("key") == key:
+                return str(config.get("style", output.get("style", "line")))
+        return "line"
+
+    def _auto_range_for_plot(self, key: str) -> Optional[dict]:
+        """Compute auto-fit range from cached data."""
+        data = self._display_cache.get(key)
+        if data is None:
+            return None
+        data = np.asarray(data, dtype=np.float32)
+        style = self._get_plot_style(key)
+
+        if style == "scatter":
+            if data.ndim == 1:
+                data = data.reshape(-1, 2) if data.size >= 2 else np.empty((0, 2))
+            if data.ndim != 2 or data.shape[1] != 2 or data.shape[0] == 0:
+                return None
+            xs, ys = data[:, 0], data[:, 1]
+            xmin, xmax = float(np.nanmin(xs)), float(np.nanmax(xs))
+            ymin, ymax = float(np.nanmin(ys)), float(np.nanmax(ys))
+            if xmin == xmax:
+                xmax = xmin + 1.0
+            if ymin == ymax:
+                ymax = ymin + 1.0
+            xpad = max((xmax - xmin) * 0.05, 1e-6)
+            ypad = max((ymax - ymin) * 0.05, 1e-6)
+            return {"xmin": xmin - xpad, "xmax": xmax + xpad,
+                    "ymin": ymin - ypad, "ymax": ymax + ypad}
+        else:
+            data = data.flatten()
+            if len(data) == 0:
+                return None
+            dmin, dmax = float(np.nanmin(data)), float(np.nanmax(data))
+            if dmin == dmax:
+                dmax = dmin + 1.0
+            return {"ymin": dmin, "ymax": dmax}
+
     def _paint_plot(self, painter: QPainter, rect: QRectF, key: str, spec: dict) -> None:
         """Paint a 1D plot with grid, axis ticks, and value labels."""
         data = self._display_cache.get(key)
@@ -1567,16 +1637,8 @@ class NodeItem(QGraphicsItem):
 
         if isinstance(data, list):
             data = np.array(data, dtype=np.float32)
-        if isinstance(data, np.ndarray):
-            data = data.flatten()
-        else:
-            data = np.asarray(data, dtype=np.float32).flatten()
-
-        if len(data) == 0:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(BG_SECONDARY))
-            painter.drawRect(rect)
-            return
+        if not isinstance(data, np.ndarray):
+            data = np.asarray(data, dtype=np.float32)
 
         config = self._display_config.get(key, {})
         style = str(config.get("style", spec.get("style", "line")))
@@ -1601,10 +1663,21 @@ class NodeItem(QGraphicsItem):
             rect.height() - top_pad - x_label_h,
         )
 
-        if style == "bar":
-            self._paint_plot_bar(painter, rect, plot_rect, data, config, spec, tick_font)
+        if style == "scatter":
+            # Scatter expects Nx2 data, don't flatten
+            if data.ndim == 1:
+                data = data.reshape(-1, 2) if data.size >= 2 else np.empty((0, 2), dtype=np.float32)
+            if data.ndim != 2 or data.shape[1] != 2 or data.shape[0] == 0:
+                return
+            self._paint_plot_scatter(painter, rect, plot_rect, data, config, spec, tick_font, key)
         else:
-            self._paint_plot_line(painter, rect, plot_rect, data, config, spec, tick_font)
+            data = data.flatten()
+            if len(data) == 0:
+                return
+            if style == "bar":
+                self._paint_plot_bar(painter, rect, plot_rect, data, config, spec, tick_font, key)
+            else:
+                self._paint_plot_line(painter, rect, plot_rect, data, config, spec, tick_font, key)
 
     @staticmethod
     def _nice_ticks(dmin: float, dmax: float, max_ticks: int = 5) -> list[float]:
@@ -1741,16 +1814,17 @@ class NodeItem(QGraphicsItem):
     def _paint_plot_bar(
         self, painter: QPainter, rect: QRectF, plot_rect: QRectF,
         data: np.ndarray, config: dict, spec: dict, tick_font: QFont,
+        key: str = "",
     ) -> None:
         """Bar chart with grid and tick labels."""
         n = len(data)
         if n == 0:
             return
 
-        scale_mode = config.get("scale_mode", spec.get("scale_mode", "auto"))
-        if scale_mode == "manual":
-            dmin = float(config.get("vmin", spec.get("vmin", 0.0)))
-            dmax = float(config.get("vmax", spec.get("vmax", 1.0)))
+        view = self._plot_view_state.get(key)
+        if view is not None:
+            dmin = view["ymin"]
+            dmax = view["ymax"]
         else:
             dmin = float(np.nanmin(data))
             dmax = float(np.nanmax(data))
@@ -1802,16 +1876,17 @@ class NodeItem(QGraphicsItem):
     def _paint_plot_line(
         self, painter: QPainter, rect: QRectF, plot_rect: QRectF,
         data: np.ndarray, config: dict, spec: dict, tick_font: QFont,
+        key: str = "",
     ) -> None:
         """Line chart with grid and tick labels."""
         n = len(data)
         if n < 2:
             return
 
-        scale_mode = config.get("scale_mode", spec.get("scale_mode", "auto"))
-        if scale_mode == "manual":
-            dmin = float(config.get("vmin", spec.get("vmin", 0.0)))
-            dmax = float(config.get("vmax", spec.get("vmax", 1.0)))
+        view = self._plot_view_state.get(key)
+        if view is not None:
+            dmin = view["ymin"]
+            dmax = view["ymax"]
         else:
             dmin = float(np.nanmin(data))
             dmax = float(np.nanmax(data))
@@ -1866,6 +1941,137 @@ class NodeItem(QGraphicsItem):
 
         # Current value label
         self._paint_plot_current_value(painter, plot_rect, data, dmin, dmax, line_color)
+
+    def _paint_plot_scatter(
+        self, painter: QPainter, rect: QRectF, plot_rect: QRectF,
+        data: np.ndarray, config: dict, spec: dict, tick_font: QFont,
+        key: str = "",
+    ) -> None:
+        """Scatter plot with grid and tick labels on both axes. Data is Nx2."""
+        n = data.shape[0]
+        if n == 0:
+            return
+
+        xs = data[:, 0]
+        ys = data[:, 1]
+
+        view = self._plot_view_state.get(key)
+        if view is not None and "xmin" in view:
+            xmin = view["xmin"]
+            xmax = view["xmax"]
+            ymin = view["ymin"]
+            ymax = view["ymax"]
+        else:
+            xmin = float(np.nanmin(xs))
+            xmax = float(np.nanmax(xs))
+            ymin = float(np.nanmin(ys))
+            ymax = float(np.nanmax(ys))
+            xpad = max((xmax - xmin) * 0.05, 1e-6)
+            ypad = max((ymax - ymin) * 0.05, 1e-6)
+            xmin -= xpad
+            xmax += xpad
+            ymin -= ypad
+            ymax += ypad
+        if xmin == xmax:
+            xmax = xmin + 1.0
+        if ymin == ymax:
+            ymax = ymin + 1.0
+
+        xrng = xmax - xmin
+        yrng = ymax - ymin
+
+        # Grid and ticks for Y-axis (reuse existing helper)
+        self._paint_plot_grid_and_ticks(painter, rect, plot_rect, ymin, ymax, n, tick_font)
+
+        # X-axis ticks and vertical grid lines
+        grid_color = QColor("#26324d")
+        tick_color = QColor("#6b7fa0")
+        x_ticks = self._nice_ticks(xmin, xmax, max_ticks=5)
+        painter.setFont(tick_font)
+        grid_pen = QPen(grid_color)
+        grid_pen.setWidthF(0.3)
+        grid_pen.setStyle(Qt.PenStyle.DotLine)
+
+        for tv in x_ticks:
+            ratio = (tv - xmin) / xrng if xrng != 0 else 0.5
+            x = plot_rect.x() + plot_rect.width() * ratio
+            if plot_rect.x() <= x <= plot_rect.x() + plot_rect.width():
+                # Vertical grid line
+                painter.setPen(grid_pen)
+                painter.drawLine(
+                    QPointF(x, plot_rect.y()),
+                    QPointF(x, plot_rect.y() + plot_rect.height()),
+                )
+                # X-axis tick label
+                painter.setPen(QPen(tick_color))
+                label = self._format_tick(tv)
+                label_rect = QRectF(
+                    x - 15, plot_rect.y() + plot_rect.height() + 1, 30, 10,
+                )
+                painter.drawText(
+                    label_rect,
+                    Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignTop,
+                    label,
+                )
+
+        # Downsample if too many points
+        if n > MAX_DISPLAY_DIM:
+            step = max(1, n // MAX_DISPLAY_DIM)
+            xs = xs[::step]
+            ys = ys[::step]
+            n = len(xs)
+
+        dot_color = QColor(spec.get("color_positive", "#00f5ff"))
+        point_radius = float(spec.get("line_width", 1.5))
+
+        # Draw points with age-based fading (older = more transparent)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for i in range(n):
+            xv = float(xs[i])
+            yv = float(ys[i])
+            xr = (xv - xmin) / xrng if xrng != 0 else 0.5
+            yr = (yv - ymin) / yrng if yrng != 0 else 0.5
+            xr = max(0.0, min(1.0, xr))
+            yr = max(0.0, min(1.0, yr))
+            px = plot_rect.x() + plot_rect.width() * xr
+            py = plot_rect.y() + plot_rect.height() * (1.0 - yr)
+
+            # Fade: oldest point ~30 alpha, newest ~220
+            alpha = int(30 + (220 - 30) * (i / max(n - 1, 1)))
+            c = QColor(dot_color)
+            c.setAlpha(alpha)
+            painter.setBrush(QBrush(c))
+            painter.drawEllipse(QPointF(px, py), point_radius, point_radius)
+
+        # Draw last point brighter and larger
+        if n > 0:
+            xv = float(xs[-1])
+            yv = float(ys[-1])
+            xr = max(0.0, min(1.0, (xv - xmin) / xrng))
+            yr = max(0.0, min(1.0, (yv - ymin) / yrng))
+            px = plot_rect.x() + plot_rect.width() * xr
+            py = plot_rect.y() + plot_rect.height() * (1.0 - yr)
+            bright = QColor(dot_color)
+            bright.setAlpha(255)
+            painter.setBrush(QBrush(bright))
+            painter.drawEllipse(QPointF(px, py), point_radius + 1.0, point_radius + 1.0)
+
+            # Value annotation
+            font = QFont(MONO_FAMILY, 6)
+            font.setWeight(QFont.Weight.DemiBold)
+            painter.setFont(font)
+            painter.setPen(QPen(dot_color))
+            label = f"{xv:.2f}, {yv:.2f}"
+            label_rect = QRectF(
+                plot_rect.x() + plot_rect.width() - 80,
+                plot_rect.y() + 1,
+                78, 10,
+            )
+            painter.drawText(
+                label_rect,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+                label,
+            )
 
     def _paint_numeric(self, painter: QPainter, rect: QRectF, key: str, spec: dict) -> None:
         """Paint a numeric value."""
@@ -2099,7 +2305,7 @@ class NodeItem(QGraphicsItem):
                 QToolTip.showText(global_pos, f"Types:\n{types_text}", view.viewport(), viewport_label_rect)
 
     def mouseDoubleClickEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        """Handle double-click on reload button or title area."""
+        """Handle double-click on reload button, title area, or plot view reset."""
         if self._dynamic:
             if event.pos().x() > self._width - 24 and event.pos().y() < HEADER_HEIGHT:
                 self.signals.reload_requested.emit(self.node_id)
@@ -2108,15 +2314,37 @@ class NodeItem(QGraphicsItem):
             self._begin_title_rename()
             event.accept()
             return
+        # Double-click on plot: reset view to auto-fit
+        plot_key = self._find_plot_key_at(event.pos())
+        if plot_key is not None and plot_key in self._plot_view_state:
+            del self._plot_view_state[plot_key]
+            self.update()
+            event.accept()
+            return
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        """Handle click on output toggle checkboxes."""
+        """Handle click on output toggle checkboxes and plot drag."""
         scene = self.scene()
         if scene and hasattr(scene, "bring_node_to_front"):
             scene.bring_node_to_front(self)
 
         pos = event.pos()
+
+        # Right-click on plot: start pan drag
+        if event.button() == Qt.MouseButton.RightButton:
+            plot_key = self._find_plot_key_at(pos)
+            if plot_key is not None:
+                if plot_key not in self._plot_view_state:
+                    auto = self._auto_range_for_plot(plot_key)
+                    if auto is not None:
+                        self._plot_view_state[plot_key] = auto
+                if plot_key in self._plot_view_state:
+                    self._plot_drag_key = plot_key
+                    self._plot_drag_last_pos = pos
+                    event.accept()
+                    return
+
         for output in self.schema.get("outputs", []):
             key = output.get("key", "")
             rect_d = self._display_rects.get(key)
@@ -2130,3 +2358,103 @@ class NodeItem(QGraphicsItem):
                 self.update()
                 return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        """Handle plot pan drag."""
+        if self._plot_drag_key is not None:
+            key = self._plot_drag_key
+            view = self._plot_view_state.get(key)
+            plot_rect = self._plot_rect_for_display(key)
+
+            if view is not None and plot_rect is not None and self._plot_drag_last_pos is not None:
+                dx_px = event.pos().x() - self._plot_drag_last_pos.x()
+                dy_px = event.pos().y() - self._plot_drag_last_pos.y()
+                style = self._get_plot_style(key)
+
+                if style == "scatter":
+                    xrng = view["xmax"] - view["xmin"]
+                    yrng = view["ymax"] - view["ymin"]
+                    dx_data = -dx_px / plot_rect.width() * xrng
+                    dy_data = dy_px / plot_rect.height() * yrng
+                    view["xmin"] += dx_data
+                    view["xmax"] += dx_data
+                    view["ymin"] += dy_data
+                    view["ymax"] += dy_data
+                else:
+                    yrng = view["ymax"] - view["ymin"]
+                    dy_data = dy_px / plot_rect.height() * yrng
+                    view["ymin"] += dy_data
+                    view["ymax"] += dy_data
+
+                self._plot_drag_last_pos = event.pos()
+                self.update()
+
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        """End plot pan drag."""
+        if self._plot_drag_key is not None and event.button() == Qt.MouseButton.RightButton:
+            self._plot_drag_key = None
+            self._plot_drag_last_pos = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event: QGraphicsSceneWheelEvent) -> None:
+        """Zoom plot on scroll: 1D for line/bar, 2D for scatter."""
+        plot_key = self._find_plot_key_at(event.pos())
+        if plot_key is None:
+            super().wheelEvent(event)
+            return
+
+        event.accept()
+
+        plot_rect = self._plot_rect_for_display(plot_key)
+        if plot_rect is None or plot_rect.width() <= 0 or plot_rect.height() <= 0:
+            return
+
+        # Initialize view state from auto range if not yet set
+        if plot_key not in self._plot_view_state:
+            auto = self._auto_range_for_plot(plot_key)
+            if auto is None:
+                return
+            self._plot_view_state[plot_key] = auto
+
+        view = self._plot_view_state[plot_key]
+        style = self._get_plot_style(plot_key)
+
+        delta = event.delta()
+        factor = 0.85 if delta > 0 else 1.0 / 0.85
+
+        if style == "scatter":
+            # 2D zoom centered on mouse position
+            mx = (event.pos().x() - plot_rect.x()) / plot_rect.width()
+            my = 1.0 - (event.pos().y() - plot_rect.y()) / plot_rect.height()
+            mx = max(0.0, min(1.0, mx))
+            my = max(0.0, min(1.0, my))
+
+            xmin, xmax = view["xmin"], view["xmax"]
+            cx = xmin + mx * (xmax - xmin)
+            new_xrng = (xmax - xmin) * factor
+            view["xmin"] = cx - mx * new_xrng
+            view["xmax"] = cx + (1.0 - mx) * new_xrng
+
+            ymin, ymax = view["ymin"], view["ymax"]
+            cy = ymin + my * (ymax - ymin)
+            new_yrng = (ymax - ymin) * factor
+            view["ymin"] = cy - my * new_yrng
+            view["ymax"] = cy + (1.0 - my) * new_yrng
+        else:
+            # 1D zoom (Y-axis only) centered on mouse Y
+            my = 1.0 - (event.pos().y() - plot_rect.y()) / plot_rect.height()
+            my = max(0.0, min(1.0, my))
+
+            ymin, ymax = view["ymin"], view["ymax"]
+            cy = ymin + my * (ymax - ymin)
+            new_yrng = (ymax - ymin) * factor
+            view["ymin"] = cy - my * new_yrng
+            view["ymax"] = cy + (1.0 - my) * new_yrng
+
+        self.update()

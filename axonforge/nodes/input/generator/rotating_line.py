@@ -24,10 +24,11 @@ class InputRotatingLine(Node):
     thickness = Integer("Thickness", default=2)
     rotation_speed = Range("Rotation Speed", default=0.1, min_val=0, max_val=1.0, scale="linear")
     interpolation = Enum("Interpolation", ["Linear", "Ease In", "Ease Out", "Ease In-Out"], default="Linear")
+    render_mode = Enum("Render", ["Anti-Aliased", "Pixel Perfect"], default="Anti-Aliased")
     
     # Checkboxes for modes
     auto_rotate = Bool("Auto Rotate", default=False)
-    random_mode = Bool("Random Mode", default=False)
+    target_mode = Enum("Mode", ["Random Mode", "Ping Pong"], default="Random Mode")
 
     # Buttons
     prev_pattern = Action("Prev", lambda self, params=None: self._on_prev(params))
@@ -38,49 +39,74 @@ class InputRotatingLine(Node):
     target_angle = State(default=0.0)
     interp_progress = State(default=0.0)
     start_angle = State(default=0.0)
+    motion_delta = State(default=0.0)
+    ping_direction = State(default=1)
 
     def init(self):
-        self._generate_new_target()
+        self._last_motion_mode = None
+        self._reset_target_motion()
         self._update_pattern()
 
     def process(self):
-        if self.random_mode:
-            # Move towards target angle using shortest path
-            self._move_towards_target()
-        elif self.auto_rotate:
-            # Continuous rotation
+        motion_mode = (bool(self.auto_rotate), str(self.target_mode))
+        if motion_mode != self._last_motion_mode:
+            self._reset_target_motion()
+            self._last_motion_mode = motion_mode
+
+        if self.auto_rotate:
             speed = float(self.rotation_speed)
             self.angle = (self.angle + speed) % (2 * np.pi)
+        else:
+            self._move_towards_target()
         
         self._update_pattern()
 
     def _move_towards_target(self):
-        """Move angle towards target using shortest path with interpolation."""
+        """Move angle towards the prepared target using the selected easing curve."""
         speed = float(self.rotation_speed)
-        current = float(self.angle)
-        target = float(self.target_angle)
-        
-        # Calculate shortest path direction
-        diff = target - current
-        # Normalize to [-pi, pi]
-        while diff > np.pi:
-            diff -= 2 * np.pi
-        while diff < -np.pi:
-            diff += 2 * np.pi
-        
-        # Check if we've reached the target
-        if abs(diff) < speed:
-            self.angle = target
-            # Generate new random target
-            self._generate_new_target()
-        else:
-            # Move in the shortest direction
-            direction = 1 if diff > 0 else -1
-            self.angle = (current + direction * speed) % (2 * np.pi)
+        if speed <= 0.0:
+            return
 
-    def _generate_new_target(self):
-        """Generate a new random target angle."""
-        self.target_angle = np.random.uniform(0, 2 * np.pi)
+        progress = min(1.0, float(self.interp_progress) + speed)
+        self.interp_progress = progress
+        eased = self._apply_interpolation(progress)
+        self.angle = (float(self.start_angle) + float(self.motion_delta) * eased) % (2 * np.pi)
+
+        if progress >= 1.0 - 1e-9:
+            self.angle = float(self.target_angle)
+            self._prepare_next_target()
+
+    def _normalize_delta(self, delta):
+        while delta > np.pi:
+            delta -= 2 * np.pi
+        while delta < -np.pi:
+            delta += 2 * np.pi
+        return delta
+
+    def _prepare_next_target(self):
+        start = float(self.angle)
+        self.start_angle = start
+        self.interp_progress = 0.0
+
+        if str(self.target_mode) == "Ping Pong":
+            direction = 1 if int(self.ping_direction) >= 0 else -1
+            delta = direction * np.pi
+            self.ping_direction = -direction
+        else:
+            raw_target = float(np.random.uniform(0.0, 2.0 * np.pi))
+            delta = self._normalize_delta(raw_target - start)
+
+        self.motion_delta = delta
+        self.target_angle = (start + delta) % (2 * np.pi)
+
+    def _reset_target_motion(self):
+        self.start_angle = float(self.angle)
+        self.target_angle = float(self.angle)
+        self.interp_progress = 0.0
+        self.motion_delta = 0.0
+        self.ping_direction = 1
+        if not self.auto_rotate:
+            self._prepare_next_target()
 
     def _apply_interpolation(self, t):
         """Apply interpolation function based on selected mode."""
@@ -116,9 +142,11 @@ class InputRotatingLine(Node):
         line_dy = np.sin(angle)
         perp_dist = np.abs(rx * line_dy - ry * line_dx)
 
-        # Create line pattern with anti-aliasing at edges
         half_thickness = thickness / 2.0
-        pattern = np.clip(half_thickness - perp_dist, 0.0, 1.0)
+        if str(self.render_mode) == "Pixel Perfect":
+            pattern = (perp_dist <= half_thickness).astype(np.float32)
+        else:
+            pattern = np.clip(half_thickness - perp_dist, 0.0, 1.0)
 
         self.output_pattern = pattern.astype(np.float32)
         self.pattern = pattern.astype(np.float32)
@@ -128,18 +156,17 @@ class InputRotatingLine(Node):
         self.output_angle = float(angle_deg)
         
         angle_deg = int(np.degrees(angle)) % 360
-        if self.random_mode:
-            target_deg = int(np.degrees(float(self.target_angle))) % 360
-            self.info = f"Angle: {angle_deg}° → {target_deg}°"
-        elif self.auto_rotate:
+        if self.auto_rotate:
             self.info = f"Angle: {angle_deg}° | Auto"
         else:
-            self.info = f"Angle: {angle_deg}°"
+            target_deg = int(np.degrees(float(self.target_angle))) % 360
+            self.info = f"Angle: {angle_deg}° → {target_deg}° | {self.target_mode}"
 
     def _on_prev(self, params):
         """Step angle backwards by 22.5 degrees."""
         step = np.pi / 8  # 22.5 degrees
         self.angle = (self.angle - step) % (2 * np.pi)
+        self._reset_target_motion()
         self._update_pattern()
         return {"status": "ok"}
 
@@ -147,5 +174,6 @@ class InputRotatingLine(Node):
         """Step angle forwards by 22.5 degrees."""
         step = np.pi / 8  # 22.5 degrees
         self.angle = (self.angle + step) % (2 * np.pi)
+        self._reset_target_motion()
         self._update_pattern()
         return {"status": "ok"}

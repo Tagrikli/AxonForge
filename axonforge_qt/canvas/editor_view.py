@@ -116,16 +116,28 @@ class EditorView(QGraphicsView):
     # ── Mouse events ─────────────────────────────────────────────────────
 
     def wheelEvent(self, event: QWheelEvent) -> None:
+        from .node_item import NodeItem
+
         item = self.itemAt(event.position().toPoint())
-        while item is not None:
-            if isinstance(item, QGraphicsProxyWidget):
-                widget = item.widget()
+        top_item = item
+        while top_item is not None:
+            if isinstance(top_item, QGraphicsProxyWidget):
+                widget = top_item.widget()
                 if isinstance(widget, QPlainTextEdit):
                     scrollbar = widget.verticalScrollBar()
                     if scrollbar is not None and scrollbar.maximum() > scrollbar.minimum():
                         super().wheelEvent(event)
                         return
-            item = item.parentItem()
+            if isinstance(top_item, NodeItem):
+                # Check if mouse is over a plot display on this node
+                scene_pos = self.mapToScene(event.position().toPoint())
+                local_pos = top_item.mapFromScene(scene_pos)
+                plot_key = top_item._find_plot_key_at(local_pos)
+                if plot_key is not None:
+                    # Let the scene deliver the event to the node item
+                    super().wheelEvent(event)
+                    return
+            top_item = top_item.parentItem()
 
         delta = event.angleDelta().y()
         factor = ZOOM_FACTOR ** delta

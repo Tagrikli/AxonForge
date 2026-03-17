@@ -512,6 +512,17 @@ class InputStickFighter(Node):
             seq.append((guard_pose, next_x))
             current_x = next_x
 
+        # Close the loop with an animated return so the sequence does not
+        # snap back to the original position between cycles.
+        if abs(current_x) > 1e-3:
+            target_x = 0.0
+            walk_poses = _WALK_POSES if target_x > current_x else list(reversed(_WALK_POSES))
+            span_x = target_x - current_x
+            for walk_idx, walk_pose in enumerate(walk_poses, start=1):
+                frac = walk_idx / (len(walk_poses) + 1)
+                seq.append((walk_pose, current_x + span_x * frac))
+            seq.append((guard_pose, target_x))
+
         return seq
 
     def _pick_poses(self):

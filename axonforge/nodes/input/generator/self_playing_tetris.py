@@ -198,6 +198,7 @@ class InputSelfPlayingTetris(Node):
     def _process_self_playing(self):
         if self._active_piece is None:
             self._spawn_piece()
+            return
 
         hold = int(self.frame_hold)
         step_frames = max(1, int(self.speed))
@@ -222,6 +223,7 @@ class InputSelfPlayingTetris(Node):
         if phase == "spawn" or self._active_piece is None:
             self._spawn_random_piece()
             self.drop_phase = "fall"
+            return
 
         hold = int(self.frame_hold)
         step_frames = max(1, int(self.speed))
@@ -366,32 +368,32 @@ class InputSelfPlayingTetris(Node):
 
         return best
 
+    def _cell_bounds(self, index, count, size):
+        start = (index * size) // count
+        end = ((index + 1) * size) // count
+        return start, end
+
     def _render_frame(self):
         size, rows, cols, cell_px = self._board_geometry()
         frame = np.zeros((size, size), dtype=np.float32)
 
-        board_px_h = rows * cell_px
-        board_px_w = cols * cell_px
-        pad_y = size - board_px_h
-        pad_x = 0
-
         for row in range(rows):
+            y0, y1 = self._cell_bounds(row, rows, size)
             for col in range(cols):
                 value = float(self._board[row, col])
                 if value <= 0.0:
                     continue
-                y0 = pad_y + row * cell_px
-                x0 = pad_x + col * cell_px
-                frame[y0:y0 + cell_px, x0:x0 + cell_px] = value
+                x0, x1 = self._cell_bounds(col, cols, size)
+                frame[y0:y1, x0:x1] = value
 
         if self._active_piece is not None:
             value = self._active_piece["value"]
             for dx, dy in self._active_piece["cells"]:
                 row = int(self.active_y) + dy
                 col = int(self.active_x) + dx
-                y0 = pad_y + row * cell_px
-                x0 = pad_x + col * cell_px
-                frame[y0:y0 + cell_px, x0:x0 + cell_px] = value
+                y0, y1 = self._cell_bounds(row, rows, size)
+                x0, x1 = self._cell_bounds(col, cols, size)
+                frame[y0:y1, x0:x1] = value
 
         return frame
 

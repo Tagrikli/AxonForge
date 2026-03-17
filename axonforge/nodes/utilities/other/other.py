@@ -6,6 +6,8 @@ from axonforge.core.node import Node
 from axonforge.core.descriptors.ports import InputPort, OutputPort
 from axonforge.core.descriptors.fields import Integer, Range, Float as FloatProp, Enum
 from axonforge.core.descriptors.displays import Text, Numeric
+from axonforge.core.descriptors.actions import Action
+from axonforge.core.descriptors.state import State
 
 
 class Uniformity(Node):
@@ -234,3 +236,155 @@ class FloatMath(Node):
             self.output = self.a if self.a > self.b else self.b
         elif self.op == "pow":
             self.output = self.a ** self.b
+
+
+class RandomProjectionSignature(Node):
+    """Project a normalized array onto a stored random reference vector."""
+
+    input_data = InputPort("Input", np.ndarray)
+    output = OutputPort("Output", float)
+    reference_vector = OutputPort("Reference Vector", np.ndarray)
+
+    set_reference = Action("Set Reference", lambda self, params=None: self._on_set_reference(params))
+
+    display = Numeric("Signature", format=".4f")
+    info = Text("Info", default="Press Set Reference")
+
+    reference_length = State(default=0)
+    stored_reference = State(default=None)
+
+    def _normalize_vector(self, array):
+        vec = np.asarray(array).flatten().astype(np.float64)
+        norm = np.linalg.norm(vec)
+        if norm <= 1e-12:
+            return None
+        return vec / norm
+
+    def _on_set_reference(self, params=None):
+        if self.input_data is None:
+            self.info = "No input to capture"
+            return {"status": "error", "message": "No input to capture"}
+
+        ref = self._normalize_vector(self.input_data)
+        if ref is None:
+            self.info = "Reference input is zero"
+            return {"status": "error", "message": "Reference input is zero"}
+
+        rng = np.random.RandomState()
+        random_vec = rng.randn(ref.size).astype(np.float64)
+        random_norm = np.linalg.norm(random_vec)
+        if random_norm <= 1e-12:
+            random_vec = np.ones(ref.size, dtype=np.float64)
+            random_norm = np.linalg.norm(random_vec)
+        random_vec = random_vec / random_norm
+
+        self.reference_length = int(ref.size)
+        self.stored_reference = random_vec.astype(np.float32)
+        self.reference_vector = self.stored_reference
+        self.info = f"Reference set | Length: {ref.size}"
+        return {"status": "ok", "message": f"Reference set with length {ref.size}"}
+
+    def process(self):
+        if self.stored_reference is None:
+            self.info = "Press Set Reference"
+            return
+
+        self.reference_vector = np.asarray(self.stored_reference, dtype=np.float32)
+
+        if self.input_data is None:
+            self.info = f"Waiting for input | Ref length: {int(self.reference_length)}"
+            return
+
+        vec = self._normalize_vector(self.input_data)
+        if vec is None:
+            self.output = 0.0
+            self.display = 0.0
+            self.info = "Input is zero vector"
+            return
+
+        ref = np.asarray(self.stored_reference, dtype=np.float64)
+        if vec.size != ref.size:
+            self.output = 0.0
+            self.display = 0.0
+            self.info = f"Size mismatch: {vec.size} vs {ref.size}"
+            return
+
+        score = float(np.dot(vec, ref))
+        self.output = score
+        self.display = score
+        self.info = f"Signature: {score:.4f} | Length: {vec.size}"
+
+
+class RandomProjection2D(Node):
+    """Project a normalized array onto two random reference vectors to get a 2D point."""
+
+    input_data = InputPort("Input", np.ndarray)
+    output = OutputPort("Output", np.ndarray)
+
+    set_reference = Action("Set Reference", lambda self, params=None: self._on_set_reference(params))
+
+    info = Text("Info", default="Press Set Reference")
+
+    stored_ref_a = State(default=None)
+    stored_ref_b = State(default=None)
+    reference_length = State(default=0)
+
+    def _normalize_vector(self, array):
+        vec = np.asarray(array).flatten().astype(np.float64)
+        norm = np.linalg.norm(vec)
+        if norm <= 1e-12:
+            return None
+        return vec / norm
+
+    def _make_random_unit(self, size):
+        rng = np.random.RandomState()
+        vec = rng.randn(size).astype(np.float64)
+        norm = np.linalg.norm(vec)
+        if norm <= 1e-12:
+            vec = np.ones(size, dtype=np.float64)
+            norm = np.linalg.norm(vec)
+        return (vec / norm).astype(np.float32)
+
+    def _on_set_reference(self, params=None):
+        if self.input_data is None:
+            self.info = "No input to capture"
+            return {"status": "error", "message": "No input to capture"}
+
+        ref = self._normalize_vector(self.input_data)
+        if ref is None:
+            self.info = "Reference input is zero"
+            return {"status": "error", "message": "Reference input is zero"}
+
+        size = ref.size
+        self.stored_ref_a = self._make_random_unit(size)
+        self.stored_ref_b = self._make_random_unit(size)
+        self.reference_length = int(size)
+        self.info = f"References set | Length: {size}"
+        return {"status": "ok", "message": f"References set with length {size}"}
+
+    def process(self):
+        if self.stored_ref_a is None:
+            self.info = "Press Set Reference"
+            return
+
+        if self.input_data is None:
+            self.info = f"Waiting for input | Ref length: {int(self.reference_length)}"
+            return
+
+        vec = self._normalize_vector(self.input_data)
+        if vec is None:
+            self.output = np.zeros(2, dtype=np.float32)
+            self.info = "Input is zero vector"
+            return
+
+        ref_a = np.asarray(self.stored_ref_a, dtype=np.float64)
+        ref_b = np.asarray(self.stored_ref_b, dtype=np.float64)
+        if vec.size != ref_a.size:
+            self.output = np.zeros(2, dtype=np.float32)
+            self.info = f"Size mismatch: {vec.size} vs {ref_a.size}"
+            return
+
+        x = float(np.dot(vec, ref_a))
+        y = float(np.dot(vec, ref_b))
+        self.output = np.array([x, y], dtype=np.float32)
+        self.info = f"x: {x:.4f}  y: {y:.4f}"
