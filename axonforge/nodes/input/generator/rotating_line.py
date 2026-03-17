@@ -26,9 +26,9 @@ class InputRotatingLine(Node):
     interpolation = Enum("Interpolation", ["Linear", "Ease In", "Ease Out", "Ease In-Out"], default="Linear")
     render_mode = Enum("Render", ["Anti-Aliased", "Pixel Perfect"], default="Anti-Aliased")
     
-    # Checkboxes for modes
-    auto_rotate = Bool("Auto Rotate", default=False)
-    target_mode = Enum("Mode", ["Random Mode", "Ping Pong"], default="Random Mode")
+    # Motion controls
+    animate = Bool("Animate", default=False)
+    target_mode = Enum("Mode", ["Linear Mode", "Random Mode", "Ping Pong"], default="Random Mode")
 
     # Buttons
     prev_pattern = Action("Prev", lambda self, params=None: self._on_prev(params))
@@ -48,16 +48,17 @@ class InputRotatingLine(Node):
         self._update_pattern()
 
     def process(self):
-        motion_mode = (bool(self.auto_rotate), str(self.target_mode))
+        motion_mode = (bool(self.animate), str(self.target_mode))
         if motion_mode != self._last_motion_mode:
             self._reset_target_motion()
             self._last_motion_mode = motion_mode
 
-        if self.auto_rotate:
-            speed = float(self.rotation_speed)
-            self.angle = (self.angle + speed) % (2 * np.pi)
-        else:
-            self._move_towards_target()
+        if self.animate:
+            if str(self.target_mode) == "Linear Mode":
+                speed = float(self.rotation_speed)
+                self.angle = (self.angle + speed) % (2 * np.pi)
+            else:
+                self._move_towards_target()
         
         self._update_pattern()
 
@@ -88,13 +89,16 @@ class InputRotatingLine(Node):
         self.start_angle = start
         self.interp_progress = 0.0
 
-        if str(self.target_mode) == "Ping Pong":
+        mode = str(self.target_mode)
+        if mode == "Ping Pong":
             direction = 1 if int(self.ping_direction) >= 0 else -1
             delta = direction * np.pi
             self.ping_direction = -direction
-        else:
+        elif mode == "Random Mode":
             raw_target = float(np.random.uniform(0.0, 2.0 * np.pi))
             delta = self._normalize_delta(raw_target - start)
+        else:
+            delta = 0.0
 
         self.motion_delta = delta
         self.target_angle = (start + delta) % (2 * np.pi)
@@ -105,7 +109,7 @@ class InputRotatingLine(Node):
         self.interp_progress = 0.0
         self.motion_delta = 0.0
         self.ping_direction = 1
-        if not self.auto_rotate:
+        if str(self.target_mode) != "Linear Mode":
             self._prepare_next_target()
 
     def _apply_interpolation(self, t):
@@ -156,11 +160,14 @@ class InputRotatingLine(Node):
         self.output_angle = float(angle_deg)
         
         angle_deg = int(np.degrees(angle)) % 360
-        if self.auto_rotate:
-            self.info = f"Angle: {angle_deg}° | Auto"
+        mode = str(self.target_mode)
+        if mode == "Linear Mode":
+            status = "Animate" if self.animate else "Paused"
+            self.info = f"Angle: {angle_deg}° | Linear Mode | {status}"
         else:
             target_deg = int(np.degrees(float(self.target_angle))) % 360
-            self.info = f"Angle: {angle_deg}° → {target_deg}° | {self.target_mode}"
+            status = "Animate" if self.animate else "Paused"
+            self.info = f"Angle: {angle_deg}° → {target_deg}° | {mode} | {status}"
 
     def _on_prev(self, params):
         """Step angle backwards by 22.5 degrees."""

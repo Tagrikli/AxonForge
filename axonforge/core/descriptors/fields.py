@@ -1,7 +1,56 @@
+import ast
+import math
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Union
 
 from .base import Field, FieldRestoreError
+
+
+def _evaluate_numeric_expression(value: Any) -> float:
+    """Safely evaluate a minimal arithmetic expression."""
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"numeric value must be finite, got {value}")
+        return result
+
+    text = str(value).strip()
+    if not text:
+        raise ValueError("numeric value cannot be empty")
+
+    try:
+        expr = ast.parse(text, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"invalid numeric expression: {value}") from exc
+
+    def _eval(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            operand = _eval(node.operand)
+            return operand if isinstance(node.op, ast.UAdd) else -operand
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+            left = _eval(node.left)
+            right = _eval(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if right == 0.0:
+                raise ValueError("division by zero")
+            return left / right
+        raise ValueError(f"unsupported numeric expression: {value}")
+
+    result = _eval(expr)
+    if not math.isfinite(result):
+        raise ValueError(f"numeric expression must evaluate to a finite value, got {value}")
+    return result
 
 
 def _serialize_project_path(path: Path, project_dir: Optional[Path]) -> str:
@@ -75,10 +124,14 @@ class Integer(Field[int]):
         default: int = 0,
         on_change: Union[str, Callable, None] = None,
     ):
-        super().__init__(label, int(default), on_change)
+        super().__init__(label, self.normalize(default), on_change)
 
     def normalize(self, value: Any) -> int:
-        return int(value)
+        numeric = _evaluate_numeric_expression(value)
+        rounded = round(numeric)
+        if not math.isclose(numeric, rounded, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(f"{self.name} must evaluate to an integer, got {value}")
+        return int(rounded)
 
     def validate(self, value: int) -> None:
         try:
@@ -104,10 +157,10 @@ class Float(Field[float]):
         default: float = 0.0,
         on_change: Union[str, Callable, None] = None,
     ):
-        super().__init__(label, float(default), on_change)
+        super().__init__(label, self.normalize(default), on_change)
 
     def normalize(self, value: Any) -> float:
-        return float(value)
+        return float(_evaluate_numeric_expression(value))
 
     def validate(self, value: float) -> None:
         try:

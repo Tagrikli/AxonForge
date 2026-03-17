@@ -21,9 +21,10 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, Signal, QObject, QTimer, QEvent
+from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, Signal, QObject, QTimer, QEvent, QRegularExpression
 from PySide6.QtGui import (
     QCursor, QPen, QBrush, QColor, QPainter, QFont, QFontMetrics, QImage, QPainterPath,
+    QRegularExpressionValidator,
 )
 from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsProxyWidget,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
 
 from .port_item import PortItem, PortHitZoneItem
 from .z_layers import Z_NODE, Z_NODE_WIDGET
+from axonforge.core.descriptors.fields import _evaluate_numeric_expression
 
 if TYPE_CHECKING:
     from .editor_scene import EditorScene
@@ -546,34 +548,41 @@ class NodeItem(QGraphicsItem):
         lr.addWidget(val_lbl)
         layout.addWidget(label_row)
 
-        spin = QSpinBox()
-        spin.setFixedHeight(18)
-        spin.setStyleSheet(
-            "QSpinBox { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; "
+        edit = QLineEdit(str(prop.get("value", prop.get("default", 0))))
+        edit.setFixedHeight(18)
+        normal_style = (
+            "QLineEdit { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; "
             "font-size: 8px; padding: 0 4px; }"
-            "QSpinBox:focus { border-color: #00f5ff; }"
-            "QSpinBox::up-button, QSpinBox::down-button { width: 0; }"
+            "QLineEdit:focus { border-color: #00f5ff; }"
         )
-        if prop.get("min") is not None:
-            spin.setMinimum(prop["min"])
-        else:
-            spin.setMinimum(-999999)
-        if prop.get("max") is not None:
-            spin.setMaximum(prop["max"])
-        else:
-            spin.setMaximum(999999)
-        spin.setValue(int(prop.get("value", prop.get("default", 0))))
-        self._disable_widget_right_click(spin)
-        line_edit = spin.lineEdit()
-        if line_edit:
-            self._disable_widget_right_click(line_edit)
+        error_style = (
+            "QLineEdit { background: #11172a; border: 1px solid #ff3b30; color: #e6f1ff; "
+            "font-size: 8px; padding: 0 4px; }"
+            "QLineEdit:focus { border-color: #ff6b6b; }"
+        )
+        edit.setStyleSheet(normal_style)
+        expr_validator = QRegularExpressionValidator(
+            QRegularExpression(r"[\d\.\s\+\-\*\/\(\)]*"),
+            edit,
+        )
+        edit.setValidator(expr_validator)
+        self._disable_widget_right_click(edit)
 
-        def on_spin_change(v: int) -> None:
-            val_lbl.setText(str(v))
-            self.signals.field_changed.emit(self.node_id, key, v)
+        def on_edit_commit() -> None:
+            text = edit.text().strip()
+            try:
+                numeric = _evaluate_numeric_expression(text)
+                rounded = round(numeric)
+                if not math.isclose(numeric, rounded, rel_tol=0.0, abs_tol=1e-9):
+                    raise ValueError("expression must evaluate to an integer")
+                val_lbl.setText(str(int(rounded)))
+                edit.setStyleSheet(normal_style)
+                self.signals.field_changed.emit(self.node_id, key, text or "0")
+            except Exception:
+                edit.setStyleSheet(error_style)
 
-        spin.valueChanged.connect(on_spin_change)
-        layout.addWidget(spin)
+        edit.editingFinished.connect(on_edit_commit)
+        layout.addWidget(edit)
 
         container.setFixedHeight(34)
         return container
@@ -599,29 +608,38 @@ class NodeItem(QGraphicsItem):
         lr.addWidget(val_lbl)
         layout.addWidget(label_row)
 
-        spin = QDoubleSpinBox()
-        spin.setFixedHeight(18)
-        spin.setStyleSheet(
-            "QDoubleSpinBox { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; "
+        edit = QLineEdit(str(prop.get("value", prop.get("default", 0.0))))
+        edit.setFixedHeight(18)
+        normal_style = (
+            "QLineEdit { background: #11172a; border: 1px solid #26324d; color: #e6f1ff; "
             "font-size: 8px; padding: 0 4px; }"
-            "QDoubleSpinBox:focus { border-color: #00f5ff; }"
-            "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; }"
+            "QLineEdit:focus { border-color: #00f5ff; }"
         )
-        spin.setMinimum(-999999.0)
-        spin.setMaximum(999999.0)
-        spin.setDecimals(6)
-        spin.setValue(float(prop.get("value", prop.get("default", 0.0))))
-        self._disable_widget_right_click(spin)
-        line_edit = spin.lineEdit()
-        if line_edit:
-            self._disable_widget_right_click(line_edit)
+        error_style = (
+            "QLineEdit { background: #11172a; border: 1px solid #ff3b30; color: #e6f1ff; "
+            "font-size: 8px; padding: 0 4px; }"
+            "QLineEdit:focus { border-color: #ff6b6b; }"
+        )
+        edit.setStyleSheet(normal_style)
+        expr_validator = QRegularExpressionValidator(
+            QRegularExpression(r"[\d\.\s\+\-\*\/\(\)]*"),
+            edit,
+        )
+        edit.setValidator(expr_validator)
+        self._disable_widget_right_click(edit)
 
-        def on_spin_change(v: float) -> None:
-            val_lbl.setText(f"{v:.3f}")
-            self.signals.field_changed.emit(self.node_id, key, v)
+        def on_edit_commit() -> None:
+            text = edit.text().strip()
+            try:
+                numeric = float(_evaluate_numeric_expression(text))
+                val_lbl.setText(f"{numeric:.3f}")
+                edit.setStyleSheet(normal_style)
+                self.signals.field_changed.emit(self.node_id, key, text or "0")
+            except Exception:
+                edit.setStyleSheet(error_style)
 
-        spin.valueChanged.connect(on_spin_change)
-        layout.addWidget(spin)
+        edit.editingFinished.connect(on_edit_commit)
+        layout.addWidget(edit)
 
         container.setFixedHeight(34)
         return container

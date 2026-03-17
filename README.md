@@ -181,8 +181,11 @@ This means feedback connections just work. Wire a node's output back to an earli
 | **Shift+D** | Duplicate selected nodes |
 | **Shift+W** | Toggle console |
 | **Shift+X** | Delete selection / hovered connection |
-| Mouse wheel | Zoom |
-| Middle drag | Pan |
+| Mouse wheel | Zoom canvas |
+| Middle drag | Pan canvas |
+| Scroll on plot | Zoom plot (Y-axis for line/bar, both axes for scatter) |
+| Right-drag on plot | Pan plot view |
+| Double-click plot | Reset plot to auto-fit |
 
 ---
 
