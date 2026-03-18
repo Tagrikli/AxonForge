@@ -1,21 +1,19 @@
 """Dataset caching and loading helpers for built-in input nodes."""
 
 import gzip
-import os
+import threading
 from pathlib import Path
 import shutil
-import sys
-import threading
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 import numpy as np
+
+from axonforge.project import DIR_DATA, DIR_DATASETS
 
 
 _DATASET_LOAD_LOCK = threading.Lock()
 _DATASET_CACHE = {}
-_APP_NAME = "AxonForge"
 _DOWNLOAD_USER_AGENT = "AxonForge dataset downloader"
+_project_dir: Path | None = None
 
 _DATASETS = {
     "mnist": {
@@ -47,24 +45,25 @@ _DATASETS = {
 }
 
 
-def _resolve_dataset_cache_dir() -> Path:
-    """Resolve a persistent dataset cache directory without requiring Qt."""
-    if sys.platform == "darwin":
-        base = Path.home() / "Library" / "Caches"
-    elif os.name == "nt":
-        local_appdata = os.environ.get("LOCALAPPDATA")
-        if local_appdata:
-            base = Path(local_appdata)
-        else:
-            base = Path.home() / "AppData" / "Local"
-    else:
-        xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
-        if xdg_cache_home:
-            base = Path(xdg_cache_home).expanduser()
-        else:
-            base = Path.home() / ".cache"
+def set_project_dir(path: Path) -> None:
+    """Set the project directory used for dataset storage."""
+    global _project_dir
+    _project_dir = path
 
-    cache_dir = base / _APP_NAME / "datasets"
+
+def _resolve_dataset_cache_dir() -> Path:
+    project = _project_dir
+    if project is None:
+        import os
+        env = os.environ.get("AXONFORGE_PROJECT_DIR")
+        if env:
+            project = Path(env)
+    if project is None:
+        raise RuntimeError(
+            "Dataset cache: project directory not set. "
+            "Call set_project_dir() before loading datasets."
+        )
+    cache_dir = project / DIR_DATA / DIR_DATASETS
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -86,6 +85,8 @@ def _mnist_cache_paths(dataset_name: str):
 
 
 def _download_file(url: str, dest: Path) -> None:
+    from urllib.request import Request, urlopen
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     req = Request(url, headers={"User-Agent": _DOWNLOAD_USER_AGENT})
     with urlopen(req) as resp, dest.open("wb") as file_obj:
@@ -97,6 +98,8 @@ def _download_file(url: str, dest: Path) -> None:
 
 
 def _ensure_mnist_source_available(dataset_name: str) -> Path | None:
+    from urllib.error import HTTPError, URLError
+
     spec = _DATASETS.get(dataset_name)
     if spec is None:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -132,7 +135,7 @@ def _ensure_mnist_source_available(dataset_name: str) -> Path | None:
                 continue
 
         try:
-            with gzip.open(gz_dest, "rb") as source:
+            with gzip.open(gz_dest, mode="rb") as source:
                 with uncompressed_dest.open("wb") as target:
                     shutil.copyfileobj(source, target)
             gz_dest.unlink(missing_ok=True)
@@ -169,7 +172,7 @@ def _build_mnist_cache(dataset_name: str, data_path: Path, images_path: Path, la
 
 
 def load_dataset_with_python_mnist(dataset_name: str = "mnist"):
-    """Load MNIST/Fashion-MNIST using python-mnist, backed by the user cache."""
+    """Load MNIST/Fashion-MNIST using python-mnist, backed by the project datasets dir."""
     if dataset_name not in _DATASETS:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 

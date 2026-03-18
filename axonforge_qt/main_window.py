@@ -119,7 +119,7 @@ class MainWindow(QMainWindow):
         self._refresh_timer.start(int(1000.0 / self._ui_fps))
 
         # ── Keyboard shortcuts ───────────────────────────────────────────
-        self._add_shortcut("Ctrl+Space", self._toggle_network)
+        self._add_shortcut("Ctrl+Space", self._toggle_network, auto_repeat=False)
         self._add_shortcut("Ctrl+Return", self._step_network)
         self._add_shortcut("Shift+W", self._toggle_console)
         self._add_shortcut("Shift+Q", self._toggle_palette_drawer)
@@ -132,9 +132,10 @@ class MainWindow(QMainWindow):
 
     # ── Header ───────────────────────────────────────────────────────────
 
-    def _add_shortcut(self, sequence: str, callback) -> None:
+    def _add_shortcut(self, sequence: str, callback, *, auto_repeat: bool = True) -> None:
         shortcut = QShortcut(QKeySequence(sequence), self)
         shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        shortcut.setAutoRepeat(auto_repeat)
         shortcut.activated.connect(callback)
         self._shortcuts.append(shortcut)
 
@@ -241,6 +242,11 @@ class MainWindow(QMainWindow):
             has_error = bool(process_error) or (node_item.node_id in failed_nodes) or bool(init_error)
             message = process_error or init_error
             node_item.set_error_state(has_error, message)
+
+        # Update processed state on nodes (consume-and-decay approach)
+        just_processed = self.bridge.consume_recently_processed_nodes()
+        for node_item in self._scene._node_items.values():
+            node_item.set_processed(node_item.node_id in just_processed)
 
         # Update network state UI
         state = self.bridge.get_network_state()
@@ -393,8 +399,11 @@ class MainWindow(QMainWindow):
         self._view.translate(delta.x(), delta.y())
 
     def _toggle_network(self) -> None:
+        for node_item in self._scene._node_items.values():
+            node_item._processed_ticks = 0
         if self.bridge.network.running:
             self.bridge.stop_network()
+            self._scene.update()
         else:
             # Clear failed nodes when starting fresh
             self.bridge.network.clear_failed_nodes()

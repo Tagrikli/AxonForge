@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Prefetch MNIST and Fashion-MNIST into the AxonForge cache directory.
+Prefetch MNIST and Fashion-MNIST into an AxonForge project directory.
 
-This script downloads the raw IDX files into the user cache and leaves the
-project directory untouched.
+Usage:
+    python utils/download_mnist_datasets.py --project-dir /path/to/project
+    python utils/download_mnist_datasets.py  # uses current working directory
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 import sys
 
@@ -17,12 +19,29 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from axonforge.nodes.utilities.dataset_cache import (
+    set_project_dir,
     _ensure_mnist_source_available,
     _resolve_dataset_raw_dir,
 )
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Prefetch MNIST datasets into a project directory.")
+    parser.add_argument(
+        "--project-dir",
+        type=Path,
+        default=Path.cwd(),
+        help="Path to the AxonForge project directory (default: current working directory)",
+    )
+    args = parser.parse_args()
+
+    project_dir = args.project_dir.resolve()
+    if not (project_dir / "axonforge.json").exists():
+        print(f"Error: {project_dir} does not look like an AxonForge project (axonforge.json not found).", file=sys.stderr)
+        return 1
+
+    set_project_dir(project_dir)
+
     dataset_names = ("mnist", "fashion_mnist")
     failures = []
 

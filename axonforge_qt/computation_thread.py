@@ -35,7 +35,8 @@ class ComputationThread(QThread):
         while not self._stop_flag:
             if network.running:
                 try:
-                    network.execute_step()
+                    step_result = network.execute_step()
+                    self.bridge.record_processed_nodes(step_result.get("updated_nodes", []))
 
                     # Update actual Hz
                     now = time.monotonic()

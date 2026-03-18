@@ -14,6 +14,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from axonforge.project import DIR_NODES, DIR_GRAPHS, DIR_DATA
+
 PROJECT_FILE = "axonforge.json"
 
 
@@ -27,7 +29,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     name = args.name or cwd.name
 
-    for folder in ("nodes", "graphs", "data"):
+    for folder in (DIR_NODES, DIR_GRAPHS, DIR_DATA):
         (cwd / folder).mkdir(exist_ok=True)
 
     project_meta = {
@@ -38,9 +40,9 @@ def cmd_init(args: argparse.Namespace) -> None:
     project_file.write_text(json.dumps(project_meta, indent=2) + "\n")
 
     print(f"Initialized AxonForge project '{name}' in {cwd}")
-    print("  nodes/    — place your custom node files here")
-    print("  graphs/   — node graphs are saved here")
-    print("  data/     — numpy array storage")
+    print(f"  {DIR_NODES}/  — place your custom node files here")
+    print(f"  {DIR_GRAPHS}/ — node graphs are saved here")
+    print(f"  {DIR_DATA}/   — numpy array and dataset storage")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -55,7 +57,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # Validate graph exists if specified
     if graph_name:
-        graph_path = cwd / "graphs" / f"{graph_name}.json"
+        graph_path = cwd / DIR_GRAPHS / f"{graph_name}.json"
         if not graph_path.exists():
             print(f"Error: Graph '{graph_name}' not found at {graph_path}")
             sys.exit(1)

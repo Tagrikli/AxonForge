@@ -60,18 +60,23 @@ class Network:
             nodes_by_id = get_all_nodes()
             connections = get_connections()
         
-        # Build incoming port mappings
+        # Build incoming port mappings and track connected nodes
         incoming: Dict[str, Dict[str, Tuple[str, str]]] = {}
+        connected_nodes: Set[str] = set()
         for conn in connections:
             incoming.setdefault(conn["to_node"], {})[conn["to_input"]] = (conn["from_node"], conn["from_output"])
-        
+            connected_nodes.add(conn["from_node"])
+            connected_nodes.add(conn["to_node"])
+
         # Get topological order (dependencies first)
         sorted_nodes = self._topological_sort(nodes_by_id, connections)
-        
+
         updated_nodes = set()
-        
-        # Process nodes in topological order
+
+        # Process nodes in topological order, skip fully disconnected nodes
         for node_id, node in sorted_nodes:
+            if node_id not in connected_nodes:
+                continue
             # Set input values from _signals_now
             # - Feedforward inputs: just stored by upstream nodes (current step)
             # - Feedback inputs: from previous step (cycle can't be resolved)
@@ -97,13 +102,13 @@ class Network:
                 # Re-raise so the caller can handle it
                 raise self.last_error
             
+            updated_nodes.add(node_id)
             if not node_outputs:
                 continue
-            
+
             # Store outputs IMMEDIATELY so downstream nodes can see them this step
             for output_key, value in node_outputs.items():
                 self._signals_now[(node_id, output_key)] = self._clone_signal(value)
-            updated_nodes.add(node_id)
         
         self._step_count += 1
         return {"step": self._step_count, "updated_nodes": list(updated_nodes)}

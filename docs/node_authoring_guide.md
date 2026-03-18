@@ -122,11 +122,13 @@ If `init()` raises, the node records a loading error and the graph does not prop
 
 `process()` is the required compute method. It is called:
 
-- during live network execution
+- during live network execution (only if the node has at least one connection)
 - when a field changes and the graph re-propagates
 - when an action runs and the graph re-propagates
 - when connections change and the graph re-propagates
 - after successful initialization in some propagation paths
+
+Fully disconnected nodes (no connections in or out) are skipped during execution.
 
 Important behavior:
 

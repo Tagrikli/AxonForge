@@ -22,8 +22,8 @@ class InputDigitMNIST(Node):
     digit_filter = Range("Digit Filter", default=-1, min_val=-1, max_val=9, step=1)
     repeat = Integer("Repeat", default=1)
 
-    next_button = Action("Next", lambda self, params=None: self.next_digit(params))
-    prev_button = Action("Prev", lambda self, params=None: self.prev_digit(params))
+    prev_button = Action("◀", lambda self, params=None: self.prev_digit(params))
+    next_button = Action("▶", lambda self, params=None: self.next_digit(params))
 
     idx = State(default=0)
     repeat_counter = State(default=0)
@@ -31,6 +31,8 @@ class InputDigitMNIST(Node):
     @background_init
     def init(self):
         self._images, self._labels = load_dataset_with_python_mnist("mnist")
+        if self._images is None or self._labels is None:
+            return
 
         # Shuffle the entire dataset so sequential access isn't in label order
         perm = np.random.permutation(len(self._images))

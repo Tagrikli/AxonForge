@@ -9,6 +9,7 @@ import json
 import importlib
 import multiprocessing
 import copy
+import os
 import sys
 import threading
 import traceback
@@ -36,11 +37,13 @@ from axonforge.core.descriptors.node import (
     build_node_palette,
 )
 from axonforge.network.network import Network, NetworkError
+from axonforge.nodes.utilities.dataset_cache import set_project_dir as _set_dataset_project_dir
+from axonforge.project import DIR_NODES, DIR_GRAPHS, DIR_DATA
 
 
 APP_NAME = "AxonForge"
-GRAPH_DATA_DIRNAME = "data"
-GRAPH_DIR_NAME = "graphs"
+GRAPH_DATA_DIRNAME = DIR_DATA
+GRAPH_DIR_NAME = DIR_GRAPHS
 DEFAULT_EDITOR_STATE = {
     "drawer_collapsed": True,
     "drawer_width": 260,
@@ -64,6 +67,9 @@ def _run_node_init_process(
         {"ok": bool, "state": dict, "error": str, "traceback": str}
     """
     try:
+        from axonforge.nodes.utilities.dataset_cache import set_project_dir as _set_dataset_project_dir
+        if project_dir:
+            _set_dataset_project_dir(Path(project_dir))
         module = importlib.import_module(module_name)
         node_class = getattr(module, class_name)
         node = node_class.from_dict(
@@ -91,6 +97,8 @@ class BridgeAPI:
 
     def __init__(self, project_dir: Path) -> None:
         self.project_dir: Path = project_dir
+        os.environ["AXONFORGE_PROJECT_DIR"] = str(project_dir)
+        _set_dataset_project_dir(project_dir)
         self.current_graph_name: Optional[str] = None
         self.current_graph_dirty: bool = False
         self.nodes: List[Node] = []
@@ -106,6 +114,9 @@ class BridgeAPI:
         self._display_buffer: Dict[str, Dict[str, Any]] = {}
         self._buffer_lock = threading.Lock()
         self._dirty = False
+        # Processed node tracking: set of node IDs since last UI consume
+        self._recently_processed: set = set()
+        self._processed_lock = threading.Lock()
         self._node_loading_states: Dict[str, Dict[str, Any]] = {}
         self._loading_lock = threading.Lock()
         self._init_jobs_lock = threading.Lock()
@@ -121,7 +132,7 @@ class BridgeAPI:
     def init(self) -> None:
         """Discover built-in and project-local nodes, build palette."""
         discover_nodes()
-        local_nodes = self.project_dir / "nodes"
+        local_nodes = self.project_dir / DIR_NODES
         if local_nodes.exists():
             discover_nodes(nodes_dir=local_nodes, package=None)
         palette = build_node_palette()
@@ -185,6 +196,20 @@ class BridgeAPI:
                 return None
             self._dirty = False
             return self._display_buffer
+
+    def record_processed_nodes(self, node_ids: List[str]) -> None:
+        """Record node IDs that were processed since the last UI consume."""
+        if not node_ids:
+            return
+        with self._processed_lock:
+            self._recently_processed.update(node_ids)
+
+    def consume_recently_processed_nodes(self) -> set:
+        """Return and clear the set of node IDs processed since the last call."""
+        with self._processed_lock:
+            result = self._recently_processed
+            self._recently_processed = set()
+            return result
 
     def get_node_loading_states(self) -> Dict[str, Dict[str, Any]]:
         """Get per-node background initialization state."""
@@ -261,7 +286,8 @@ class BridgeAPI:
                     else:
                         if self.network and not self.network.running:
                             try:
-                                self.network.propagate_from_node(node_id, recompute_start=True)
+                                result = self.network.propagate_from_node(node_id, recompute_start=True)
+                                self.record_processed_nodes(result.get("updated_nodes", []))
                             except NetworkError as exc:
                                 print(f"Background init propagation error in '{node_id}': {exc}")
                                 if exc.traceback:
@@ -322,9 +348,9 @@ class BridgeAPI:
         # Propagate current state only when init succeeded.
         if init_ok and self.network:
             try:
-                self.network.propagate_current_state()
+                result = self.network.propagate_current_state()
+                self.record_processed_nodes(result.get("updated_nodes", []))
             except NetworkError as e:
-                # Error is stored in network.last_error and node is tracked in failed_nodes
                 print(f"Node creation error: {e}")
                 if e.traceback:
                     print(e.traceback)
@@ -380,9 +406,9 @@ class BridgeAPI:
         # Only propagate when network is not running (let running network handle processing)
         if self.network and not self.network.running:
             try:
-                self.network.propagate_from_node(node_id, recompute_start=True)
+                result = self.network.propagate_from_node(node_id, recompute_start=True)
+                self.record_processed_nodes(result.get("updated_nodes", []))
             except NetworkError as e:
-                # Error is stored in network.last_error and node is tracked in failed_nodes
                 print(f"Field set error in '{node_id}.{field_key}': {e}")
                 if e.traceback:
                     print(e.traceback)
@@ -397,9 +423,9 @@ class BridgeAPI:
         result = action(params)
         if self.network:
             try:
-                self.network.propagate_from_node(node_id, recompute_start=True)
+                result = self.network.propagate_from_node(node_id, recompute_start=True)
+                self.record_processed_nodes(result.get("updated_nodes", []))
             except NetworkError as e:
-                # Error is stored in network.last_error and node is tracked in failed_nodes
                 print(f"Action execution error in '{node_id}.{action_key}': {e}")
                 if e.traceback:
                     print(e.traceback)
@@ -427,7 +453,8 @@ class BridgeAPI:
             handler(node, row, col, button)
         if self.network and not self.network.running:
             try:
-                self.network.propagate_from_node(node_id, recompute_start=True)
+                result = self.network.propagate_from_node(node_id, recompute_start=True)
+                self.record_processed_nodes(result.get("updated_nodes", []))
             except NetworkError as e:
                 print(f"Display event error in '{node_id}.{display_key}': {e}")
                 if e.traceback:
@@ -487,9 +514,9 @@ class BridgeAPI:
 
         if self.network:
             try:
-                self.network.propagate_from_node(to_node, recompute_start=True)
+                result = self.network.propagate_from_node(to_node, recompute_start=True)
+                self.record_processed_nodes(result.get("updated_nodes", []))
             except NetworkError as e:
-                # Error is stored in network.last_error and node is tracked in failed_nodes
                 print(f"Connection creation error from '{from_node}.{from_output}' to '{to_node}.{to_input}': {e}")
                 if e.traceback:
                     print(e.traceback)
@@ -519,6 +546,8 @@ class BridgeAPI:
     def stop_network(self) -> None:
         if self.network:
             self.network.stop()
+        with self._processed_lock:
+            self._recently_processed.clear()
 
     def step_network(self) -> None:
         if self.network.running:
@@ -669,6 +698,8 @@ class BridgeAPI:
 
             self._clear_graph_state()
 
+            _node_missing_arrays: List[str] = []
+
             def _array_loader(ref: dict) -> Any:
                 ref_file = str(ref.get("file", "")).strip()
                 if not ref_file:
@@ -679,6 +710,7 @@ class BridgeAPI:
                 except ValueError:
                     raise ValueError(f"Invalid ndarray_ref path outside project: {ref_file}")
                 if not array_path.exists():
+                    _node_missing_arrays.append(ref_file)
                     raise FileNotFoundError(f"Array file not found: {array_path}")
                 import numpy as np
                 return np.load(array_path, allow_pickle=False)
@@ -688,11 +720,18 @@ class BridgeAPI:
                 cls = self.node_classes.get(nd.get("type"))
                 if not cls:
                     continue
+                _node_missing_arrays.clear()
                 node = cls.from_dict(
                     nd,
                     array_loader=_array_loader,
                     project_dir=self.project_dir,
                 )
+                if _node_missing_arrays:
+                    missing_msg = "State reset to default — missing array files:\n" + "\n".join(
+                        f"  {p}" for p in _node_missing_arrays
+                    )
+                    existing = str(getattr(node, "_loading_error", "") or "")
+                    node._loading_error = (existing + "\n" + missing_msg).strip()
                 new_id = register_node(node)
                 node_id_map[nd.get("id")] = new_id
                 with self._nodes_lock:
@@ -829,6 +868,7 @@ class BridgeAPI:
         if new_class.__name__ in self.node_classes:
             self.node_classes[new_class.__name__] = new_class
 
+        _set_dataset_project_dir(self.project_dir)
         new_node.init()
         self._set_node_loading_state(node_id, False, "")
         self.snapshot_displays()
@@ -836,7 +876,7 @@ class BridgeAPI:
 
     def rediscover(self) -> None:
         new_palette = rediscover_nodes()
-        local_nodes = self.project_dir / "nodes"
+        local_nodes = self.project_dir / DIR_NODES
         if local_nodes.exists():
             discover_nodes(nodes_dir=local_nodes, package=None)
             new_palette = build_node_palette()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from axonforge.project import DIR_NODES
 import importlib.util
 import json
 import sys
@@ -59,7 +60,7 @@ def _determine_import_mode(target_path: Path, project_dir: Optional[Path]) -> Tu
         return "builtin", module_name, builtin_nodes_dir, "axonforge.nodes", warnings
 
     if project_dir is not None:
-        project_nodes_dir = (project_dir / "nodes").resolve()
+        project_nodes_dir = (project_dir / DIR_NODES).resolve()
         try:
             project_relative = target_path.relative_to(project_nodes_dir)
         except ValueError:

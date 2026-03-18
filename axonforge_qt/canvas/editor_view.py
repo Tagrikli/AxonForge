@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QGraphicsView, QGraphicsProxyWidget, QApplication,
 
 from .editor_scene import EditorScene
 from .node_quick_add import NodeQuickAddPopup
+from axonforge.project import DIR_DATA
 
 # Theme
 BG_PRIMARY = QColor("#0b0f1a")
@@ -265,9 +266,9 @@ class EditorView(QGraphicsView):
         # Try to get the current project directory from the bridge
         project_dir = getattr(self._scene.bridge, "project_dir", None)
         if project_dir:
-            save_dir = os.path.join(str(project_dir), "data", "screenshots")
+            save_dir = os.path.join(str(project_dir), DIR_DATA, "screenshots")
         else:
-            save_dir = os.path.join(os.getcwd(), "data", "screenshots")
+            save_dir = os.path.join(os.getcwd(), DIR_DATA, "screenshots")
             
         os.makedirs(save_dir, exist_ok=True)
 

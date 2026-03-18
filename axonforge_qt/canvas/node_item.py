@@ -48,6 +48,7 @@ BG_HEADER = QColor("#19213a")
 BORDER_COLOR = QColor("#26324d")
 BORDER_HOVER = QColor("#555555")
 BORDER_SELECTED = QColor("#00f5ff")
+BORDER_ACTIVE = QColor("#47cfff")
 TEXT_PRIMARY = QColor("#e6f1ff")
 TEXT_SECONDARY = QColor("#8fa4ff")
 ACCENT = QColor("#00f5ff")
@@ -239,6 +240,9 @@ class NodeItem(QGraphicsItem):
         # Error state
         self._error_state = False
         self._error_message = ""
+
+        # Active/processed state — countdown in refresh ticks
+        self._processed_ticks = 0
 
         # Background initialization state
         self._loading = bool(schema.get("loading", False))
@@ -1182,6 +1186,18 @@ class NodeItem(QGraphicsItem):
             self._loading_timer.stop()
         self.update()
 
+    # Number of UI refresh ticks the processed border stays visible.
+    PROCESSED_DISPLAY_TICKS = 6
+
+    def set_processed(self, active: bool) -> None:
+        """Mark node as recently processed (starts a tick countdown) or decay it."""
+        if active:
+            self._processed_ticks = self.PROCESSED_DISPLAY_TICKS
+            self.update()
+        elif self._processed_ticks > 0:
+            self._processed_ticks -= 1
+            self.update()
+
     def set_error_state(self, has_error: bool, message: str = "") -> None:
         """
         Set error state and optional process-error message.
@@ -1203,9 +1219,11 @@ class NodeItem(QGraphicsItem):
         painter.setBrush(QBrush(BG_NODE))
         painter.drawRect(rect)
 
-        # Border - error state takes precedence
+        # Border priority: error > processed > selected > hovered > default
         if self._error_state:
-            pen = QPen(ERROR_COLOR, 2)  # Thicker red border for errors
+            pen = QPen(ERROR_COLOR, 2)
+        elif self._processed_ticks > 0:
+            pen = QPen(BORDER_ACTIVE, 3)
         elif self.isSelected():
             pen = QPen(BORDER_SELECTED, 1)
         elif self._hovered:
@@ -2174,7 +2192,12 @@ class NodeItem(QGraphicsItem):
                 # Check if content changed for re-layout
                 if key in self._display_cache:
                     old_value = self._display_cache[key]
-                    if str(old_value) != str(display_value):
+                    if isinstance(display_value, np.ndarray) and isinstance(old_value, np.ndarray):
+                        _values_differ = (old_value.shape != display_value.shape or
+                                          not np.array_equal(old_value, display_value, equal_nan=True))
+                    else:
+                        _values_differ = str(old_value) != str(display_value)
+                    if _values_differ:
                         # Check if this output needs re-layout
                         for output in self.schema.get("outputs", []):
                             if output.get("key") == key:

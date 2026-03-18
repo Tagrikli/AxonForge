@@ -8,7 +8,5 @@ wheels/
 
 # Virtual environments
 .venv
-data/mnist/
-data/cifar10/
-data/classified/
-workspaces/
+ax_data/
+.claude

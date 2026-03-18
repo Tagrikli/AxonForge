@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
 """
-Download CIFAR-10 dataset for use with MiniCortex.
+Download CIFAR-10 dataset into an AxonForge project directory.
+
+Usage:
+    python utils/download_cifar10.py --project-dir /path/to/project
+    python utils/download_cifar10.py  # uses current working directory
 
 Output layout:
-  data/cifar10/
-    data_batch_1
-    data_batch_2
-    data_batch_3
-    data_batch_4
-    data_batch_5
+  ax_data/cifar10/
+    data_batch_1 .. data_batch_5
     test_batch
     batches.meta
-
-The CIFAR-10 node is configured to look in this location.
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 import tarfile
 import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from axonforge.project import DIR_DATA
 
 
 CIFAR10_URL = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
@@ -62,8 +67,21 @@ def extract_tar_gz(tar_path: Path, extract_to: Path) -> None:
 
 
 def main() -> int:
-    repo_root = Path(__file__).resolve().parents[1]
-    data_dir = repo_root / "data"
+    parser = argparse.ArgumentParser(description="Download CIFAR-10 into an AxonForge project directory.")
+    parser.add_argument(
+        "--project-dir",
+        type=Path,
+        default=Path.cwd(),
+        help="Path to the AxonForge project directory (default: current working directory)",
+    )
+    args = parser.parse_args()
+
+    project_dir = args.project_dir.resolve()
+    if not (project_dir / "axonforge.json").exists():
+        print(f"Error: {project_dir} does not look like an AxonForge project (axonforge.json not found).", file=sys.stderr)
+        return 1
+
+    data_dir = project_dir / DIR_DATA
     cifar_dir = data_dir / "cifar10"
     temp_dir = data_dir / "temp"
     

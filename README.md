@@ -12,6 +12,8 @@
   Wire nodes, connect feedback loops, tweak parameters live, and watch your system converge — all without leaving the canvas.
 </p>
 
+> **Highly experimental.** This project is under active development. APIs, node interfaces, graph formats, and runtime behavior may change without notice. Expect breaking changes between commits. If you build on this, pin to a specific commit.
+
 ---
 
 ## Why AxonForge?
@@ -160,8 +162,9 @@ Each tick of the graph:
 
 1. **Topological sort** orders nodes by dependency (Kahn's algorithm).
 2. Nodes in cycles are placed last — their inputs carry **previous-step values**, giving you implicit feedback with one-step delay.
-3. Each node's `process()` runs in order: read inputs, compute, write outputs.
-4. Displays update in real-time on the canvas.
+3. **Disconnected nodes are skipped** — only nodes with at least one connection participate in execution.
+4. Each node's `process()` runs in order: read inputs, compute, write outputs.
+5. Displays update in real-time on the canvas.
 
 This means feedback connections just work. Wire a node's output back to an earlier node's input, and the graph becomes recurrent — no special configuration needed.
 

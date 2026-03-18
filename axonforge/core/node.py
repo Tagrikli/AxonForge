@@ -299,6 +299,8 @@ class Node(metaclass=NodeMeta):
         node.node_id = data.get("id")
         node.name = data.get("name", cls.__name__)
         
+        _MISSING = object()
+
         def _deserialize_value(val: Any) -> Any:
             if isinstance(val, list):
                 return [_deserialize_value(item) for item in val]
@@ -307,7 +309,10 @@ class Node(metaclass=NodeMeta):
                 if val_type == "ndarray":
                     return np.array(val["data"])
                 if val_type == "ndarray_ref" and callable(array_loader):
-                    return array_loader(val)
+                    try:
+                        return array_loader(val)
+                    except FileNotFoundError:
+                        return _MISSING
                 return {key: _deserialize_value(item) for key, item in val.items()}
             return val
 
@@ -320,6 +325,8 @@ class Node(metaclass=NodeMeta):
                 continue
             try:
                 deserialized = _deserialize_value(field_val)
+                if deserialized is _MISSING:
+                    continue
                 restored = descriptor.deserialize_value(deserialized, project_dir=project_dir)
                 setattr(node, field_name, restored)
             except FieldRestoreError as e:
@@ -337,7 +344,10 @@ class Node(metaclass=NodeMeta):
         for state_name, state_val in data.get("states", {}).items():
             if hasattr(node, state_name):
                 try:
-                    setattr(node, state_name, _deserialize_value(state_val))
+                    deserialized = _deserialize_value(state_val)
+                    if deserialized is _MISSING:
+                        continue
+                    setattr(node, state_name, deserialized)
                 except Exception as e:
                     print(f"Error restoring state {state_name}: {e}")
         if restore_errors:
