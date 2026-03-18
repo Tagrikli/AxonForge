@@ -2,6 +2,10 @@
   <img src="data/media_github/axonforge.gif" alt="AxonForge demo" width="720">
 </p>
 
+<p align="center">
+  <img src="data/media_github/axonforge2.gif" alt="AxonForge demo 2" width="720">
+</p>
+
 <h1 align="center">AxonForge</h1>
 
 <p align="center">
