@@ -2403,8 +2403,8 @@ class NodeItem(QGraphicsItem):
                 event.accept()
                 return
 
-        # Right-click on plot: start pan drag
-        if event.button() == Qt.MouseButton.RightButton:
+        # Left-click on plot: start pan drag
+        if event.button() == Qt.MouseButton.LeftButton:
             plot_key = self._find_plot_key_at(pos)
             if plot_key is not None:
                 if plot_key not in self._plot_view_state:
@@ -2490,7 +2490,7 @@ class NodeItem(QGraphicsItem):
                 self._heatmap_touch_button = ""
                 event.accept()
                 return
-        if self._plot_drag_key is not None and event.button() == Qt.MouseButton.RightButton:
+        if self._plot_drag_key is not None and event.button() == Qt.MouseButton.LeftButton:
             self._plot_drag_key = None
             self._plot_drag_last_pos = None
             event.accept()
