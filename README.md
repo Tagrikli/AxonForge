@@ -60,7 +60,7 @@ mkdir ~/research/my-experiment && cd ~/research/my-experiment
 axonforge init --name "my-experiment"
 
 # Launch the editor
-axonforge run
+axonforge
 ```
 
 This gives you:

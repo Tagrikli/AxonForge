@@ -2,8 +2,8 @@
 cli.py — Command-line interface for AxonForge.
 
 Usage:
+    axonforge [graph_name]         Launch the GUI for the current project.
     axonforge init [--name NAME]   Create a new project in the current directory.
-    axonforge run [graph_name]     Launch the GUI for the current project.
     axonforge docs TOPIC           Print built-in authoring help for external users and agents.
     axonforge validate-node PATH   Validate a node definition file.
 """
@@ -97,7 +97,10 @@ def cmd_docs(args: argparse.Namespace) -> None:
     print(output)
 
 
-def main() -> None:
+SUBCOMMANDS = {"init", "docs", "validate-node", "-h", "--help"}
+
+
+def _build_subcommand_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="axonforge",
         description="AxonForge — node-based visual editor for bio-inspired learning algorithms",
@@ -107,10 +110,6 @@ def main() -> None:
     # init
     init_parser = subparsers.add_parser("init", help="Initialize a new project in the current directory")
     init_parser.add_argument("--name", type=str, default=None, help="Project name (defaults to directory name)")
-
-    # run
-    run_parser = subparsers.add_parser("run", help="Launch the GUI for the current project")
-    run_parser.add_argument("graph_name", nargs="?", default=None, help="Graph to open on startup")
 
     # docs
     docs_parser = subparsers.add_parser(
@@ -158,20 +157,30 @@ def main() -> None:
         help="Print machine-readable JSON output",
     )
 
-    args = parser.parse_args()
+    return parser
 
-    if args.command is None:
-        parser.print_help()
-        sys.exit(0)
 
-    if args.command == "init":
-        cmd_init(args)
-    elif args.command == "run":
+def main() -> None:
+    # If the first argument is a known subcommand (or help flag), use subcommand parsing.
+    # Otherwise, treat bare `axonforge [graph_name]` as the run/launch command.
+    if len(sys.argv) > 1 and sys.argv[1] in SUBCOMMANDS:
+        parser = _build_subcommand_parser()
+        args = parser.parse_args()
+
+        if args.command == "init":
+            cmd_init(args)
+        elif args.command == "docs":
+            cmd_docs(args)
+        elif args.command == "validate-node":
+            cmd_validate_node(args)
+    else:
+        parser = argparse.ArgumentParser(
+            prog="axonforge",
+            description="AxonForge — node-based visual editor for bio-inspired learning algorithms",
+        )
+        parser.add_argument("graph_name", nargs="?", default=None, help="Graph to open on startup")
+        args = parser.parse_args()
         cmd_run(args)
-    elif args.command == "docs":
-        cmd_docs(args)
-    elif args.command == "validate-node":
-        cmd_validate_node(args)
 
 
 if __name__ == "__main__":
