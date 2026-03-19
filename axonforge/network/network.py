@@ -32,6 +32,9 @@ class Network:
         self.failed_nodes: Set[str] = set()  # Track nodes that failed processing
         self.failed_node_errors: Dict[str, str] = {}  # node_id -> latest error message
         self._step_lock = threading.Lock()
+        # "Run for N steps" support
+        self.run_for_target: Optional[int] = None  # target step count to stop at
+        self.run_for_start: Optional[int] = None   # step count when run-for began
     
     def start(self):
         self.running = True
@@ -111,8 +114,15 @@ class Network:
                 self._signals_now[(node_id, output_key)] = self._clone_signal(value)
         
         self._step_count += 1
+
+        # Auto-stop when run-for target is reached
+        if self.run_for_target is not None and self._step_count >= self.run_for_target:
+            self.running = False
+            self.run_for_target = None
+            self.run_for_start = None
+
         return {"step": self._step_count, "updated_nodes": list(updated_nodes)}
-    
+
     def _topological_sort(self, nodes_by_id: Dict[str, Node], connections: List[dict]) -> List[Tuple[str, Node]]:
         """
         Sort nodes so dependencies are processed before dependents.

@@ -235,25 +235,31 @@ class Node(metaclass=NodeMeta):
 
     def to_dict(
         self,
-        array_serializer: Optional[Callable[[np.ndarray], Any]] = None,
+        array_serializer: Optional[Callable[[str, str, np.ndarray], Any]] = None,
         project_dir: Optional[Path] = None,
     ) -> dict:
         """
         Return a serializable representation of the node for persistence.
+
+        *array_serializer* — ``f(node_id, key, array) -> serializable``.
+        *key* is the field/state name that owns the array.
         """
+        node_id = self.node_id
         data = {
-            "id": self.node_id,
+            "id": node_id,
             "type": self.node_type,
             "name": self.name,
             "position": self.position,
             "fields": {},
             "states": {},
         }
-        
+
+        _current_key: list[str] = [""]
+
         def _serialize_value(val: Any) -> Any:
             if isinstance(val, np.ndarray):
                 if array_serializer is not None:
-                    return array_serializer(val)
+                    return array_serializer(node_id or "", _current_key[0], val)
                 return {"_type": "ndarray", "data": val.tolist()}
             if isinstance(val, np.generic):
                 return val.item()
@@ -271,12 +277,14 @@ class Node(metaclass=NodeMeta):
 
         # Save all field values
         for field_name, descriptor in getattr(self.__class__, "_fields", {}).items():
+            _current_key[0] = field_name
             val = getattr(self, field_name)
             serialized = descriptor.serialize_value(val, project_dir=project_dir)
             data["fields"][field_name] = _serialize_value(serialized)
 
         # Save all state values
         for state_name in getattr(self.__class__, "_states", {}).keys():
+            _current_key[0] = state_name
             val = getattr(self, state_name)
             data["states"][state_name] = _serialize_value(val)
                 

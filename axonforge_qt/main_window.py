@@ -9,6 +9,7 @@ from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QSplitter, QCheckBox, QSpinBox, QMessageBox,
+    QProgressBar, QFrame,
 )
 
 from .bridge import BridgeAPI
@@ -96,6 +97,10 @@ class MainWindow(QMainWindow):
         self._main_splitter.splitterMoved.connect(self._on_main_splitter_moved)
         root_layout.addWidget(self._main_splitter)
 
+        # ── Status bar ────────────────────────────────────────────────
+        self._status_bar = self._build_status_bar()
+        root_layout.addWidget(self._status_bar)
+
         # Enable anchor-preserving behavior while dragging splitter handles.
         h_handle = self._splitter.handle(1)
         if h_handle is not None:
@@ -166,7 +171,37 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        # Network controls
+        # ── Batch execution group ─────────────────────────────────────
+        self._execute_input = QSpinBox()
+        self._execute_input.setObjectName("execute_input")
+        self._execute_input.setRange(1, 1_000_000)
+        self._execute_input.setValue(1000)
+        self._execute_input.setToolTip("Number of steps to execute")
+        layout.addWidget(self._execute_input)
+
+        self._execute_btn = QPushButton("Execute")
+        self._execute_btn.setObjectName("execute_btn")
+        self._execute_btn.clicked.connect(self._on_execute_clicked)
+        layout.addWidget(self._execute_btn)
+
+        self._live_display_checkbox = QCheckBox("Live Display")
+        self._live_display_checkbox.setObjectName("live_display_checkbox")
+        self._live_display_checkbox.setChecked(False)
+        self._live_display_checkbox.setToolTip(
+            "Update node displays during execution (slower)"
+        )
+        layout.addWidget(self._live_display_checkbox)
+
+        # ── Separator ─────────────────────────────────────────────────
+        layout.addSpacing(6)
+        sep = QFrame()
+        sep.setObjectName("header_separator")
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFixedHeight(28)
+        layout.addWidget(sep)
+        layout.addSpacing(6)
+
+        # ── Continuous group ──────────────────────────────────────────
         self._toggle_btn = QPushButton("Start")
         self._toggle_btn.setObjectName("network_toggle")
         self._toggle_btn.clicked.connect(self._toggle_network)
@@ -195,11 +230,31 @@ class MainWindow(QMainWindow):
         self._speed_input.valueChanged.connect(self._on_speed_changed)
         layout.addWidget(self._speed_input)
 
-        self._actual_hz = QLabel("0.0 Hz")
-        self._actual_hz.setObjectName("actual_hz")
-        layout.addWidget(self._actual_hz)
-
         return header
+
+    def _build_status_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("status_bar")
+        bar.setFixedHeight(22)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(12)
+
+        self._status_hz = QLabel("0.0 Hz")
+        self._status_hz.setObjectName("status_hz")
+        layout.addWidget(self._status_hz)
+
+        layout.addStretch()
+
+        self._execute_progress = QProgressBar()
+        self._execute_progress.setObjectName("execute_progress")
+        self._execute_progress.setFixedWidth(200)
+        self._execute_progress.setTextVisible(True)
+        self._execute_progress.setFormat("%v / %m")
+        self._execute_progress.setVisible(False)
+        layout.addWidget(self._execute_progress)
+
+        return bar
 
     # ── Initial state ────────────────────────────────────────────────────
 
@@ -218,35 +273,47 @@ class MainWindow(QMainWindow):
 
     # ── UI refresh ───────────────────────────────────────────────────────
 
+    @property
+    def _executing(self) -> bool:
+        """True when a batch execution is in progress."""
+        return self.bridge.network.run_for_target is not None
+
     def _on_refresh_tick(self) -> None:
         if self._transition_active or self._window_closing:
             return
+
+        network = self.bridge.network
+        executing = self._executing
+        skip_display = executing and not self._live_display_checkbox.isChecked()
+
         self.bridge.poll_background_init_jobs()
         self._update_header_label()
-        buf = self.bridge.read_display_buffer()
-        if buf is not None:
-            self._scene.update_displays(buf)
 
-        loading_states = self.bridge.get_node_loading_states()
-        for node_item in self._scene._node_items.values():
-            state = loading_states.get(node_item.node_id, {})
-            node_item.set_loading_state(bool(state.get("loading", False)))
+        if not skip_display:
+            buf = self.bridge.read_display_buffer()
+            if buf is not None:
+                self._scene.update_displays(buf)
 
-        # Update error states on nodes (network/process errors + init errors)
-        failed_nodes = self.bridge.network.failed_nodes
-        failed_node_errors = self.bridge.network.failed_node_errors
-        for node_item in self._scene._node_items.values():
-            state = loading_states.get(node_item.node_id, {})
-            init_error = str(state.get("error", "") or "")
-            process_error = failed_node_errors.get(node_item.node_id, "")
-            has_error = bool(process_error) or (node_item.node_id in failed_nodes) or bool(init_error)
-            message = process_error or init_error
-            node_item.set_error_state(has_error, message)
+            loading_states = self.bridge.get_node_loading_states()
+            for node_item in self._scene._node_items.values():
+                state = loading_states.get(node_item.node_id, {})
+                node_item.set_loading_state(bool(state.get("loading", False)))
 
-        # Update processed state on nodes (consume-and-decay approach)
-        just_processed = self.bridge.consume_recently_processed_nodes()
-        for node_item in self._scene._node_items.values():
-            node_item.set_processed(node_item.node_id in just_processed)
+            # Update error states on nodes (network/process errors + init errors)
+            failed_nodes = network.failed_nodes
+            failed_node_errors = network.failed_node_errors
+            for node_item in self._scene._node_items.values():
+                state = loading_states.get(node_item.node_id, {})
+                init_error = str(state.get("error", "") or "")
+                process_error = failed_node_errors.get(node_item.node_id, "")
+                has_error = bool(process_error) or (node_item.node_id in failed_nodes) or bool(init_error)
+                message = process_error or init_error
+                node_item.set_error_state(has_error, message)
+
+            # Update processed state on nodes (consume-and-decay approach)
+            just_processed = self.bridge.consume_recently_processed_nodes()
+            for node_item in self._scene._node_items.values():
+                node_item.set_processed(node_item.node_id in just_processed)
 
         # Update network state UI
         state = self.bridge.get_network_state()
@@ -257,7 +324,6 @@ class MainWindow(QMainWindow):
         self._toggle_btn.setProperty("running", "true" if running else "false")
         self._toggle_btn.style().unpolish(self._toggle_btn)
         self._toggle_btn.style().polish(self._toggle_btn)
-        self._actual_hz.setText(f"{state['actual_hz']:.1f} Hz")
         if self._speed_input.value() != speed:
             self._speed_input.blockSignals(True)
             self._speed_input.setValue(speed)
@@ -268,7 +334,28 @@ class MainWindow(QMainWindow):
             self._max_speed_checkbox.blockSignals(False)
         self._speed_input.setEnabled(not max_speed)
 
-        # Update header bar style based on running state
+        # Update batch execution progress
+        if executing:
+            elapsed = network.get_step_count() - (network.run_for_start or 0)
+            self._execute_progress.setValue(elapsed)
+        elif self._execute_progress.isVisible():
+            # Execution just finished
+            self._execute_progress.setValue(self._execute_progress.maximum())
+            self._finish_execution()
+
+        # Status bar
+        self._status_hz.setText(f"{state['actual_hz']:.1f} Hz")
+
+        # Disable live display checkbox while any network mode is active
+        self._live_display_checkbox.setEnabled(not running)
+
+        # Disable batch controls while continuous mode is active (and vice versa)
+        continuous_running = running and not executing
+        if not executing:
+            self._execute_btn.setEnabled(not continuous_running)
+            self._execute_input.setEnabled(not continuous_running)
+
+        # Header bar running style
         self._header_bar.setProperty("running", "true" if running else "false")
         self._header_bar.style().unpolish(self._header_bar)
         self._header_bar.style().polish(self._header_bar)
@@ -403,6 +490,8 @@ class MainWindow(QMainWindow):
             node_item._processed_ticks = 0
         if self.bridge.network.running:
             self.bridge.stop_network()
+            if self._execute_progress.isVisible():
+                self._finish_execution()
             self._scene.update()
         else:
             # Clear failed nodes when starting fresh
@@ -411,6 +500,50 @@ class MainWindow(QMainWindow):
 
     def _step_network(self) -> None:
         self.bridge.step_network()
+
+    def _on_execute_clicked(self) -> None:
+        """Toggle batch execution: start if idle, abort if running."""
+        if self._executing:
+            # Abort
+            self.bridge.stop_network()
+            self._finish_execution()
+            self._scene.update()
+            return
+        if self.bridge.network.running:
+            return  # continuous mode is active, ignore
+        steps = self._execute_input.value()
+        self._execute_progress.setRange(0, steps)
+        self._execute_progress.setValue(0)
+        self._execute_progress.setVisible(True)
+        self._execute_btn.setText("Abort")
+        self._execute_btn.setProperty("executing", "true")
+        self._execute_btn.style().unpolish(self._execute_btn)
+        self._execute_btn.style().polish(self._execute_btn)
+        self._execute_input.setEnabled(False)
+        self._toggle_btn.setEnabled(False)
+        self._iterate_btn.setEnabled(False)
+        # Force max speed for batch execution
+        self._pre_execute_max_speed = self.bridge.network.max_speed
+        self.bridge.set_network_max_speed(True)
+        for node_item in self._scene._node_items.values():
+            node_item._processed_ticks = 0
+        self.bridge.run_network_for(steps)
+
+    def _finish_execution(self) -> None:
+        """Clean up after batch execution completes or is aborted."""
+        self.bridge.network.run_for_target = None
+        self.bridge.network.run_for_start = None
+        self._execute_progress.setVisible(False)
+        self._execute_btn.setText("Execute")
+        self._execute_btn.setProperty("executing", "false")
+        self._execute_btn.style().unpolish(self._execute_btn)
+        self._execute_btn.style().polish(self._execute_btn)
+        self._execute_input.setEnabled(True)
+        self._toggle_btn.setEnabled(True)
+        self._iterate_btn.setEnabled(True)
+        # Restore previous max speed setting
+        prev = getattr(self, "_pre_execute_max_speed", False)
+        self.bridge.set_network_max_speed(prev)
 
     def _on_speed_changed(self, value: int) -> None:
         self.bridge.set_network_speed(float(value))

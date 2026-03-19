@@ -13,7 +13,6 @@ import os
 import sys
 import threading
 import traceback
-import uuid
 from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
@@ -561,6 +560,15 @@ class BridgeAPI:
             # error stored in network.last_error
         self.snapshot_displays()
 
+    def run_network_for(self, steps: int) -> None:
+        """Start the network and auto-stop after *steps* iterations."""
+        if self.network.running:
+            return
+        self.network.clear_failed_nodes()
+        self.network.run_for_start = self.network.get_step_count()
+        self.network.run_for_target = self.network.get_step_count() + steps
+        self.network.start()
+
     def set_network_speed(self, speed: float) -> None:
         clamped = max(1.0, min(1000.0, float(speed)))
         self.network.speed = clamped
@@ -651,10 +659,10 @@ class BridgeAPI:
         data_dir = self.project_dir / GRAPH_DATA_DIRNAME
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        def _array_serializer(array: Any) -> Dict[str, Any]:
+        def _array_serializer(node_id: str, key: str, array: Any) -> Dict[str, Any]:
             if not hasattr(array, "shape"):
                 return {"_type": "unsupported_array"}
-            array_name = f"{uuid.uuid4().hex}.npy"
+            array_name = f"{node_id}_{key}.npy"
             array_rel_path = Path(GRAPH_DATA_DIRNAME) / array_name
             array_abs_path = self.project_dir / array_rel_path
             import numpy as np
